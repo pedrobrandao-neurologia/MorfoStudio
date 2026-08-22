@@ -1,0 +1,17 @@
+{
+  "name": "Morfo Studio — morfometria cerebral no navegador",
+  "short_name": "Morfo Studio",
+  "description": "Segmentação e volumetria cerebral (aparc+aseg, cerebelo, tronco) a partir de DICOM ou NIfTI, inteiramente no navegador.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#14171c",
+  "theme_color": "#1e2229",
+  "lang": "pt-BR",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "categories": ["medical", "productivity", "education"]
+}

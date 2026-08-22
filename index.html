@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Morfo Studio — morfometria cerebral no navegador</title>
+<meta name="description" content="Segmentação e volumetria cerebral (aparc+aseg, cerebelo, tronco) a partir de DICOM ou NIfTI, inteiramente no navegador, com exportação CSV, JSON, SAV e PDF.">
+<meta name="theme-color" content="#1e2229">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+  <header class="bar">
+    <div class="brand">Morfo Studio <small>morfometria cerebral no navegador</small></div>
+    <div class="btn-row">
+      <button class="btn" id="btnDicom" title="Selecionar uma pasta com arquivos DICOM">Abrir pasta DICOM</button>
+      <button class="btn" id="btnNifti" title="Abrir .nii ou .nii.gz">Abrir NIfTI</button>
+      <button class="btn ghost sm" id="btnDemo" title="Volume sintético para testar o fluxo (não é um cérebro real)">Exemplo</button>
+    </div>
+    <input type="file" id="inDicom" webkitdirectory directory multiple>
+    <input type="file" id="inNifti" accept=".nii,.nii.gz,.gz,.mgz,.mgh,.nrrd">
+    <div class="spacer"></div>
+    <div class="status">
+      <span><i class="dot" id="dotNet"></i><span id="netText">rede</span></span>
+      <span><i class="dot" id="dotGpu"></i><span id="gpuText">gpu</span></span>
+      <span><i class="dot" id="dotSw"></i><span id="swText">cache</span></span>
+    </div>
+  </header>
+
+  <nav class="rail" aria-label="Etapas do pipeline">
+    <ol class="steps" id="steps">
+      <li class="step active" data-step="input"><div class="t">Entrada</div><div class="d">DICOM → NIfTI ou NIfTI direto</div></li>
+      <li class="step" data-step="quality"><div class="t">Qualidade</div><div class="d">Resolução, cortes, contraste</div></li>
+      <li class="step" data-step="segment"><div class="t">Segmentação</div><div class="d">Conformação 256³ + modelo</div></li>
+      <li class="step" data-step="stats"><div class="t">Estatísticas</div><div class="d">Volumes, lobos, assimetria</div></li>
+      <li class="step" data-step="export"><div class="t">Exportar</div><div class="d">CSV · JSON · SAV · PDF · NIfTI</div></li>
+    </ol>
+
+    <section class="rail-section">
+      <h3>Sujeito</h3>
+      <div class="field"><label for="subjectId">Identificador</label><input type="text" id="subjectId" placeholder="sub-001" autocomplete="off"></div>
+      <div class="field"><label for="sessionId">Sessão / data</label><input type="text" id="sessionId" placeholder="ses-01 ou 2026-08" autocomplete="off"></div>
+    </section>
+
+    <section class="rail-section">
+      <h3>Modelo</h3>
+      <div class="field">
+        <label for="modelSel">Atlas de saída</label>
+        <select id="modelSel">
+          <option value="aparc_aseg_104">aparc+aseg 104 — cortical L/R, cerebelo, tronco, CC</option>
+          <option value="aparc_aseg_50">aparc+aseg 50 — homólogos L/R fundidos</option>
+          <option value="aseg_18">aseg 18 — subcortical + tecidos</option>
+          <option value="tissue_3">Tecidos — SC / SB / líquor</option>
+          <option value="mask">Máscara cerebral</option>
+          <option value="custom">Modelo próprio (tfjs, URL)</option>
+        </select>
+      </div>
+      <div class="field" id="customModelField" hidden>
+        <label for="customModelUrl">URL do model.json</label><input type="url" id="customModelUrl" placeholder="https://…/model.json">
+        <label for="customLabelsUrl" style="margin-top:6px">URL do labels.json</label><input type="url" id="customLabelsUrl" placeholder="https://…/labels.json">
+        <p class="hint">Entrada 256³ uint8 conformado (padrão brainchop). Para redes tipo SynthSeg, converta para tfjs e aponte aqui.</p>
+      </div>
+      <label class="chk"><input type="checkbox" id="lowMem"> Baixa memória (convolução sequencial, mais lento)</label>
+      <div class="field" style="margin-top:8px"><label for="backendSel">Backend de inferência</label>
+        <select id="backendSel"><option value="webgl">WebGL (GPU)</option><option value="cpu">CPU</option></select></div>
+      <button class="btn primary" id="btnRun" disabled style="width:100%;justify-content:center;margin-top:6px">Segmentar</button>
+      <p class="hint" id="runHint">Abra um exame para habilitar.</p>
+    </section>
+
+    <section class="rail-section">
+      <h3>Modo robusto</h3>
+      <label class="chk"><input type="checkbox" id="optResample" checked> Reamostrar cortes espessos (cúbica)</label>
+      <label class="chk"><input type="checkbox" id="optBias" checked> Corrigir campo de viés (homomórfico)</label>
+      <label class="chk"><input type="checkbox" id="optDenoise"> Suavizar ruído (baixo campo)</label>
+      <p class="hint">Aproximação clássica do que SynthSR/SynthSeg fazem por rede neural. Para exames muito fora do domínio, prefira <code>mri_synthseg --robust</code> ou <code>recon-all-clinical</code> no FreeSurfer e importe o NIfTI aqui para estatísticas.</p>
+    </section>
+
+    <section class="rail-section">
+      <h3>Sobre</h3>
+      <p class="hint">Modelos MeshNet do brainchop (neuroneural), visualização NiiVue, conversão dcm2niix (WASM). Tudo roda localmente; nenhum dado sai do computador. Licenças em <code>licenses/</code>.</p>
+    </section>
+  </nav>
+
+  <main class="view" id="view">
+    <canvas id="gl"></canvas>
+    <div class="hud">
+      <span class="tag" id="tagDims">—</span>
+      <span class="tag" id="tagLoc">—</span>
+      <span class="spacer"></span>
+      <div class="opacity" id="opacityBox" hidden>rótulos <input type="range" id="opacity" min="0" max="1" step="0.05" value="0.65"></div>
+      <select id="layoutSel" title="Disposição das vistas">
+        <option value="mpr">Multiplanar + 3D</option>
+        <option value="axial">Axial</option>
+        <option value="coronal">Coronal</option>
+        <option value="sagittal">Sagital</option>
+        <option value="render">3D</option>
+      </select>
+    </div>
+    <div class="dropzone" id="dropzone">
+      <div class="big">Arraste uma pasta DICOM ou um NIfTI</div>
+      <div class="sub">O DICOM é convertido com dcm2niix aqui no navegador. O volume é conformado para 256³ a 1 mm e segmentado com modelos MeshNet. Nada é enviado a servidores.</div>
+    </div>
+    <div class="progress"><div id="progressBar"></div></div>
+  </main>
+
+  <aside class="inspector" aria-label="Inspetor">
+    <section class="panel" id="panelInput">
+      <h3>Exame</h3>
+      <dl class="kv" id="kvInput"><dt>Arquivo</dt><dd>—</dd></dl>
+    </section>
+
+    <section class="panel" id="panelQuality">
+      <h3>Qualidade da entrada</h3>
+      <div id="qualityBody"><p class="empty">A régua aparece quando um exame é carregado: compara a espessura de corte com o domínio de treino do modelo (T1 isotrópico 1 mm) e decide o ramo do pipeline.</p></div>
+    </section>
+
+    <section class="panel grow" id="panelStats">
+      <h3>Regiões</h3>
+      <div id="statsBody"><p class="empty">Nenhuma segmentação ainda.</p></div>
+    </section>
+
+    <section class="panel" id="panelExport">
+      <h3>Exportar</h3>
+      <div class="btn-row" id="exportRow">
+        <button class="btn sm" data-export="csv" disabled>CSV</button>
+        <button class="btn sm" data-export="json" disabled>JSON</button>
+        <button class="btn sm" data-export="sav" disabled>SAV</button>
+        <button class="btn sm" data-export="pdf" disabled>PDF</button>
+        <button class="btn sm" data-export="seg" disabled>Segmentação .nii.gz</button>
+        <button class="btn sm" data-export="conf" disabled>Conformado .nii.gz</button>
+        <button class="btn sm" data-export="src" disabled>NIfTI convertido</button>
+        <button class="btn sm" data-export="zip" disabled>Pacote .zip</button>
+      </div>
+      <h3 style="margin-top:14px">Coorte <span class="cohort-count" id="cohortCount">0 sujeitos</span></h3>
+      <div class="btn-row">
+        <button class="btn sm" id="btnAddCohort" disabled>Adicionar este sujeito</button>
+        <button class="btn sm" data-export="cohort-csv" disabled>CSV largo</button>
+        <button class="btn sm" data-export="cohort-sav" disabled>SAV</button>
+        <button class="btn sm ghost" id="btnClearCohort" disabled>Limpar</button>
+      </div>
+      <p class="hint">A coorte fica salva neste navegador (uma linha por sujeito, colunas por região) para análise em SPSS/R.</p>
+    </section>
+  </aside>
+
+  <footer class="log"><span class="cursor">›</span><span id="logText">pronto</span></footer>
+</div>
+
+<dialog id="seriesDlg">
+  <h2>Séries encontradas</h2>
+  <p class="hint" style="margin:0 0 10px">Escolha a série a segmentar (idealmente T1 volumétrico).</p>
+  <ul class="series" id="seriesList"></ul>
+  <div class="btn-row" style="justify-content:flex-end;margin-top:10px"><button class="btn" id="seriesCancel">Cancelar</button></div>
+</dialog>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
