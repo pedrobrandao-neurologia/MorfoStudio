@@ -21,7 +21,7 @@
       <button class="btn ghost sm" id="btnDemo" title="Volume sintético para testar o fluxo (não é um cérebro real)">Exemplo</button>
     </div>
     <input type="file" id="inDicom" webkitdirectory directory multiple>
-    <input type="file" id="inNifti" accept=".nii,.nii.gz,.gz,.mgz,.mgh,.nrrd">
+    <input type="file" id="inNifti" accept=".nii,.nii.gz,.gz,.mgz,.mgh,.nrrd" multiple>
     <div class="spacer"></div>
     <div class="status">
       <span><i class="dot" id="dotNet"></i><span id="netText">rede</span></span>
@@ -71,11 +71,19 @@
     </section>
 
     <section class="rail-section">
-      <h3>Modo robusto</h3>
-      <label class="chk"><input type="checkbox" id="optResample" checked> Reamostrar cortes espessos (cúbica)</label>
-      <label class="chk"><input type="checkbox" id="optBias" checked> Corrigir campo de viés (homomórfico)</label>
+      <h3>Pré-processamento</h3>
+      <label class="chk"><input type="checkbox" id="optMoco" checked> Corrigir movimento entre volumes (séries 4D / NIfTI repetidos)</label>
+      <label class="chk"><input type="checkbox" id="optBias" checked> Corrigir campo de viés (inomogeneidade)</label>
+      <div class="field" style="margin:4px 0 0 22px">
+        <select id="biasMethodSel" title="Método de correção de viés">
+          <option value="n4">N4 (ANTs-like, B-splines + Wiener)</option>
+          <option value="homomorfico">Homomórfico (rápido)</option>
+        </select>
+      </div>
+      <label class="chk"><input type="checkbox" id="optBiasStd"> Aplicar viés também no pipeline padrão</label>
+      <label class="chk"><input type="checkbox" id="optResample" checked> Reamostrar cortes espessos (cúbica; modo robusto)</label>
       <label class="chk"><input type="checkbox" id="optDenoise"> Suavizar ruído (baixo campo)</label>
-      <p class="hint">Aproximação clássica do que SynthSR/SynthSeg fazem por rede neural. Para exames muito fora do domínio, prefira <code>mri_synthseg --robust</code> ou <code>recon-all-clinical</code> no FreeSurfer e importe o NIfTI aqui para estatísticas.</p>
+      <p class="hint">Movimento: registro rígido 6-DOF + média, análogo ao <code>antsMotionCorr</code> (só corrige movimento <em>entre</em> volumes; ghosting dentro de um volume único exigiria o k-space). Viés: reimplementação do N4ITK (Tustison 2010) usado no ANTs, ou filtragem homomórfica rápida. Para exames muito fora do domínio, prefira <code>mri_synthseg --robust</code>/<code>recon-all-clinical</code> e importe o NIfTI aqui.</p>
     </section>
 
     <section class="rail-section">

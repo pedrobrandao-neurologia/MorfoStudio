@@ -6,6 +6,10 @@
 //  4. suavização 3D leve opcional (ruído de baixo campo)
 // Não substitui uma rede treinada com domain randomization; reduz o "degrau" entre cortes e o viés de iluminação
 // antes da conformação para 256³/1 mm e da inferência.
+// A correção de campo de viés tem dois métodos: 'n4' (estilo N4ITK/ANTs, ver js/n4.js) e
+// 'homomorfico' (filtragem homomórfica rápida, implementada abaixo).
+
+import { n4BiasCorrect } from './n4.js'
 
 function post(msg, transfer) { self.postMessage(msg, transfer || []) }
 function progress(msg, frac) { post({ cmd: 'progress', message: msg, frac }) }
@@ -154,12 +158,19 @@ self.onmessage = (e) => {
         log.push(`eixo ${'xyz'[axis]}: ${pixdims[axis].toFixed(2)} → ${curPix[axis].toFixed(2)} mm (Catmull-Rom)`)
       }
     }
-    // 2/3. campo de viés
+    // 2/3. campo de viés: N4 (ANTs-like) ou homomórfico
     if (options.biasCorrect !== false) {
-      progress('Correção homomórfica de campo de viés', 0.6)
-      const b = biasCorrect(cur, curDims, curPix, options.biasSigmaMM || 30)
-      cur = b.img
-      log.push(b.applied ? `campo de viés corrigido (σ≈${options.biasSigmaMM || 30} mm)` : 'campo de viés: máscara insuficiente, etapa ignorada')
+      if ((options.biasMethod || 'n4') === 'n4') {
+        progress('Correção de campo de viés N4 (ANTs-like)', 0.6)
+        const b = n4BiasCorrect(cur, curDims, curPix, options.n4 || {}, (msg, frac) => progress(msg, 0.6 + 0.2 * (frac || 0)))
+        cur = b.img
+        log.push(...(b.applied ? b.log : ['N4: máscara insuficiente, etapa ignorada']))
+      } else {
+        progress('Correção homomórfica de campo de viés', 0.6)
+        const b = biasCorrect(cur, curDims, curPix, options.biasSigmaMM || 30)
+        cur = b.img
+        log.push(b.applied ? `campo de viés corrigido (homomórfico, σ≈${options.biasSigmaMM || 30} mm)` : 'campo de viés: máscara insuficiente, etapa ignorada')
+      }
     }
     // 4. suavização leve
     if (options.denoise) {
