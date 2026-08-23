@@ -10,7 +10,7 @@ import { detectContrast, assessQuality, renderRuler } from './quality.js'
 import { buildReport } from './report.js'
 import { hasHippocampus, runHippoWorker, buildHippoOverlay, hippoNiftiGz, hippoToCSV, hippoWideColumns, hippoColor } from './hippocampus.js'
 
-const VERSION = '0.2.0'
+const VERSION = '0.3.0'
 const $ = (id) => document.getElementById(id)
 
 // ids do brainchop-parameters.js (1-indexado): [memória alta, memória baixa]
@@ -26,7 +26,7 @@ const MODELS = {
 const state = {
   nv: null, base: null, conformed: null, seg: null, labelsVol: null,
   source: null, quality: null, pipeline: 'padrao', contrast: 'desconhecido',
-  result: null, meta: null, labelNames: null, colormap: null, modelKey: null, modelEntry: null, hippo: null,
+  result: null, meta: null, labelNames: null, colormap: null, modelKey: null, modelEntry: null, hippo: null, motion: null,
   worker: null, preWorker: null, rejectPending: null, busy: false, cancelled: false, robustLog: [], cohort: [], gpuRenderer: ''
 }
 
@@ -89,11 +89,83 @@ async function showVolume(vol) {
   $('tagDims').textContent = `${vol.hdr.dims.slice(1, 4).join('×')} · ${vol.hdr.pixDims.slice(1, 4).map((v) => v.toFixed(2)).join('×')} mm`
 }
 
+// ---------------------------------------------------------------- correção de movimento (antsMotionCorr-like)
+function runMotionWorker({ volumes, dims, pixdims }) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./motion-worker.js', import.meta.url), { type: 'module' })
+    state.preWorker = w
+    state.rejectPending = reject
+    w.onmessage = (e) => {
+      const m = e.data
+      if (m.cmd === 'progress') { log(m.message); if (m.frac != null) progress(0.05 + m.frac * 0.6) }
+      else if (m.cmd === 'error') { w.terminate(); state.preWorker = null; reject(new Error(m.message)) }
+      else if (m.cmd === 'done') { w.terminate(); state.preWorker = null; resolve(m) }
+    }
+    w.onerror = (e) => { w.terminate(); state.preWorker = null; reject(new Error(e.message || 'worker de movimento falhou')) }
+    w.postMessage({ volumes, dims, pixdims, options: { metric: 'mi' } }, volumes.map((v) => v.buffer))
+  })
+}
+
+/** transforma volumes alinhados+médios num File NIfTI 3D e reabre no fluxo padrão */
+async function motionCorrectAndOpen({ volumes, dims, pixdims, affine, name, source }) {
+  log(`Correção de movimento: ${volumes.length} volumes (registro rígido + média)…`); progress(0.05)
+  const m = await runMotionWorker({ volumes, dims, pixdims })
+  const img = new Float32Array(m.img)
+  let mx = 0; for (let i = 0; i < img.length; i++) if (img[i] > mx) mx = img[i]
+  const sc = mx > 0 ? 32000 / mx : 1
+  const i16 = new Int16Array(img.length)
+  for (let i = 0; i < i16.length; i++) i16[i] = Math.round(img[i] * sc)
+  const buf = writeNifti({ dims, pixdims, affine, dtype: 'int16', data: i16, sclSlope: 1 / sc, description: 'Morfo moco media' })
+  const file = new File([buf], name.replace(/\.nii(\.gz)?$/i, '') + '_moco.nii')
+  state.motion = { nVolumes: volumes.length, params: m.params, meanDisplacement: m.meanDisplacement, log: m.log, elapsed_s: (m.elapsed_ms / 1000).toFixed(1) }
+  await openNiftiFile(file, { ...source, moco: true })
+  log(`Movimento corrigido (${volumes.length} volumes, deslocamento médio ${m.meanDisplacement.toFixed(2)} mm) — média pronta para segmentar`)
+}
+
+/** vários NIfTI 3D do mesmo protocolo → registro rígido + média */
+async function openMultiNifti(files) {
+  try {
+    setStep('input', 'running')
+    const vols = []
+    for (const f of files) {
+      log(`Lendo ${f.name}…`)
+      vols.push(await NVImage.loadFromFile({ file: f, name: f.name }))
+    }
+    const d0 = vols[0].hdr.dims.slice(1, 4).join('×')
+    if (!vols.every((v) => v.hdr.dims.slice(1, 4).join('×') === d0)) {
+      log('Volumes com dimensões diferentes — abrindo apenas o primeiro (aquisições repetidas devem ter a mesma matriz).')
+      return openNiftiFile(files[0])
+    }
+    if (!$('optMoco').checked) return openNiftiFile(files[0])
+    const volumes = vols.map((v) => volumeToFloat32(v))
+    await motionCorrectAndOpen({
+      volumes, dims: vols[0].hdr.dims.slice(1, 4), pixdims: vols[0].hdr.pixDims.slice(1, 4).map(Math.abs),
+      affine: vols[0].hdr.affine.flat(), name: files[0].name,
+      source: { kind: 'nifti', nFiles: files.length, sidecar: { SeriesDescription: `média de ${files.length} aquisições registradas (moco)` } }
+    })
+  } catch (e) {
+    console.error(e); log('Falha na correção de movimento: ' + e.message); progress(0); setStep('input', 'active')
+  }
+}
+
 // ---------------------------------------------------------------- entrada
 async function openNiftiFile(file, source = {}) {
   try {
     log(`Lendo ${file.name}…`); progress(0.2)
     const vol = await NVImage.loadFromFile({ file, name: file.name })
+    // série 4D: corrige movimento entre volumes e segue com a média (análogo ao antsMotionCorr)
+    const nt = vol.hdr.dims[0] >= 4 ? vol.hdr.dims[4] : 1
+    if (nt > 1 && !source.moco && $('optMoco').checked) {
+      const [nx, ny, nz] = vol.hdr.dims.slice(1, 4)
+      const nvox = nx * ny * nz
+      const all = volumeToFloat32in4D(vol, nvox, nt)
+      return motionCorrectAndOpen({
+        volumes: all, dims: [nx, ny, nz], pixdims: vol.hdr.pixDims.slice(1, 4).map(Math.abs),
+        affine: vol.hdr.affine.flat(), name: file.name,
+        source: { kind: source.kind || 'nifti', nFiles: source.nFiles || 1, sidecar: { ...(source.sidecar || {}), SeriesDescription: `${source.sidecar?.SeriesDescription || file.name} — média de ${nt} volumes (moco)` } }
+      })
+    }
+    if (!source.moco) state.motion = null
     state.base = vol; state.conformed = null; state.labelsVol = null; state.result = null
     resetHippo()
     state.source = { kind: 'nifti', fileName: file.name, nFiles: 1, sidecar: {}, ...source }
@@ -238,15 +310,29 @@ function volumeToFloat32(vol) {
   return out
 }
 
-function runPreprocess(vol) {
+/** extrai os nt volumes 3D de um NIfTI 4D como Float32Array[] (com scl_slope/inter) */
+function volumeToFloat32in4D(vol, nvox, nt) {
+  const slope = vol.hdr.scl_slope || 1, inter = vol.hdr.scl_inter || 0
+  const src = vol.img
+  const out = []
+  for (let t = 0; t < nt; t++) {
+    const f = new Float32Array(nvox)
+    const off = t * nvox
+    for (let i = 0; i < nvox; i++) f[i] = src[off + i] * slope + inter
+    out.push(f)
+  }
+  return out
+}
+
+function runPreprocess(vol, { allowResample = true } = {}) {
   return new Promise((resolve, reject) => {
     const w = new Worker(new URL('./preprocess-worker.js', import.meta.url), { type: 'module' })
     state.preWorker = w
     state.rejectPending = reject
     const img = volumeToFloat32(vol)
     const dims = vol.hdr.dims.slice(1, 4), pixdims = vol.hdr.pixDims.slice(1, 4).map(Math.abs), affine = vol.hdr.affine.flat()
-    const options = { targetMM: 1.0, biasCorrect: $('optBias').checked, denoise: $('optDenoise').checked }
-    if (!$('optResample').checked) options.targetMM = 1e9
+    const options = { targetMM: 1.0, biasCorrect: $('optBias').checked, biasMethod: $('biasMethodSel').value, denoise: $('optDenoise').checked }
+    if (!$('optResample').checked || !allowResample) options.targetMM = 1e9
     w.onmessage = async (e) => {
       const m = e.data
       if (m.cmd === 'progress') { log(m.message); progress(0.05 + m.frac * 0.2) }
@@ -349,6 +435,7 @@ async function finishSegmentation({ conf, labels, modelSel, backend, t0 }) {
     sourceKind: state.source.kind, nFiles: state.source.nFiles, acquisition: state.source.sidecar?.SeriesDescription || state.source.fileName,
     dims: state.base.hdr.dims.slice(1, 4), vox: q.vox, voxMin: q.voxMin, voxMax: q.voxMax, nSlices: q.nSlices, contrast: q.contrast,
     qualityTier: q.tier, pipeline: state.pipeline, robustLog: state.robustLog, modelKey: modelSel.key, modelLabel: modelSel.label,
+    motion: state.motion ? { nVolumes: state.motion.nVolumes, meanDisplacement: state.motion.meanDisplacement, params: state.motion.params } : null,
     backend, elapsedS: ((performance.now() - t0) / 1000).toFixed(1), processedAt: nowStamp(), app: `Morfo Studio ${VERSION}`
   }
   renderStats()
@@ -465,6 +552,10 @@ async function runSegmentation() {
     if (state.pipeline === 'robusto') {
       log('Modo robusto: pré-processando…'); progress(0.05)
       vol = await runPreprocess(vol)
+    } else if ($('optBias').checked && $('optBiasStd').checked) {
+      // pipeline padrão com correção de viés explícita (sem reamostragem)
+      log('Corrigindo campo de viés antes de conformar…'); progress(0.05)
+      vol = await runPreprocess(vol, { allowResample: false })
     }
     if (state.cancelled) throw new Error('cancelado')
     log('Conformando para 256³ a 1 mm…'); progress(0.28)
@@ -548,9 +639,10 @@ function exportJSONObject() {
     summaries: state.result.summaries, lobes: state.result.lobes, hemispheres: state.result.hemispheres, asymmetry: state.result.asymmetry,
     hippocampus: state.hippo?.result || null, regions: state.result.regions }
 }
-/** linha larga do sujeito, incluindo colunas hipocampais quando a análise foi executada */
+/** linha larga do sujeito, incluindo colunas hipocampais e de movimento quando presentes */
 function wideRow() {
-  return { ...toWideRow(state.result, state.meta), ...hippoWideColumns(state.hippo?.result) }
+  const extra = state.motion ? { moco_volumes: state.motion.nVolumes, moco_mean_disp_mm: state.motion.meanDisplacement } : {}
+  return { ...toWideRow(state.result, state.meta), ...extra, ...hippoWideColumns(state.hippo?.result) }
 }
 function snapshot() {
   const nv = state.nv
@@ -678,7 +770,12 @@ function bind() {
   $('btnDicom').onclick = () => $('inDicom').click()
   $('btnNifti').onclick = () => $('inNifti').click()
   $('inDicom').onchange = (e) => { if (e.target.files.length) openDicomFiles(e.target.files); e.target.value = '' }
-  $('inNifti').onchange = (e) => { if (e.target.files[0]) openNiftiFile(e.target.files[0]); e.target.value = '' }
+  $('inNifti').onchange = (e) => {
+    const files = Array.from(e.target.files)
+    if (files.length > 1) openMultiNifti(files)
+    else if (files[0]) openNiftiFile(files[0])
+    e.target.value = ''
+  }
   $('btnDemo').onclick = loadDemo
   $('btnRun').onclick = runSegmentation
   $('btnHippo').onclick = runHippoAnalysis
@@ -704,9 +801,10 @@ function bind() {
     e.preventDefault(); view.classList.remove('dragover')
     const files = await readDropped(e.dataTransfer)
     if (!files.length) return
-    const nii = files.find((f) => /\.(nii|nii\.gz|mgz|mgh|nrrd)$/i.test(f.name))
-    if (files.length === 1 && nii) openNiftiFile(nii)
-    else if (nii && files.length < 4) openNiftiFile(nii)
+    const niis = files.filter((f) => /\.(nii|nii\.gz|mgz|mgh|nrrd)$/i.test(f.name))
+    if (niis.length === 1) openNiftiFile(niis[0])
+    else if (niis.length > 1 && niis.length === files.length) openMultiNifti(niis)
+    else if (niis.length && files.length < 4) openNiftiFile(niis[0])
     else openDicomFiles(files)
   })
   // rede / service worker

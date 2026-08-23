@@ -34,9 +34,10 @@ export function buildReport({ meta, quality, result, snapshot, modelInfo, hippo 
     ['Dimensões', `${meta.dims.join(' × ')} voxels · ${meta.vox.map((v) => v.toFixed(2)).join(' × ')} mm`],
     ['Contraste', quality.contrast],
     ['Modelo', `${modelInfo.label} (${modelInfo.key}) · backend ${meta.backend}`],
-    ['Pipeline', meta.pipeline === 'robusto' ? `robusto — ${meta.robustLog.join('; ')}` : 'padrão (conformação 256³ linear, normalização por quantis)'],
+    ['Pipeline', meta.pipeline === 'robusto' ? `robusto — ${meta.robustLog.join('; ')}` : meta.robustLog?.length ? `padrão — ${meta.robustLog.join('; ')}` : 'padrão (conformação 256³ linear, normalização por quantis)'],
     ['Tempo', `${meta.elapsedS} s`]
   ]
+  if (meta.motion) kv.splice(5, 0, ['Movimento', `corrigido entre ${meta.motion.nVolumes} volumes (rígido 6-DOF + média, antsMotionCorr-like); deslocamento médio ${fmt(meta.motion.meanDisplacement, 2)} mm`])
   for (const [k, v] of kv) { y += 13; pdf.text(M, y, k, { size: 9, color: MUTED }); pdf.text(M + 95, y, v, { size: 9, maxWidth: W - 95 }) }
   y += 22
   // qualidade
@@ -177,13 +178,14 @@ export function buildReport({ meta, quality, result, snapshot, modelInfo, hippo 
   const paras = [
     `Processamento inteiramente local no navegador. ${meta.sourceKind === 'dicom' ? 'Conversão DICOM→NIfTI por dcm2niix (WebAssembly). ' : ''}O volume foi conformado ao padrão FreeSurfer (256³, 1 mm isotrópico, uint8 com normalização robusta por quantis) e segmentado por rede MeshNet do projeto brainchop (${modelInfo.label}); rótulos filtrados por componentes conexos. Volumes = nº de voxels rotulados × 1 mm³ no espaço conformado.`,
     meta.pipeline === 'robusto'
-      ? 'Ramo robusto: antes da conformação, os eixos com espaçamento > 1,15 × alvo foram reamostrados por interpolação cúbica (Catmull-Rom), o campo de viés foi corrigido por filtragem homomórfica (σ ≈ 30 mm) e, se habilitado, aplicou-se suavização 3D. Isso mitiga, sem eliminar, o erro de volume parcial de cortes espessos; não equivale a SynthSR/SynthSeg, que usam redes treinadas com domain randomization.'
-      : 'Ramo padrão: o exame está dentro ou próximo do domínio de treino (T1 ≈ 1 mm isotrópico).',
+      ? 'Ramo robusto: antes da conformação, os eixos com espaçamento > 1,15 × alvo foram reamostrados por interpolação cúbica (Catmull-Rom), o campo de viés foi corrigido pelo método selecionado — N4 (reimplementação do N4ITK/ANTs: deconvolução de Wiener do histograma + B-splines multinível; Tustison 2010) ou filtragem homomórfica (σ ≈ 30 mm) — e, se habilitado, aplicou-se suavização 3D. Isso mitiga, sem eliminar, o erro de volume parcial de cortes espessos; não equivale a SynthSR/SynthSeg, que usam redes treinadas com domain randomization.'
+      : 'Ramo padrão: o exame está dentro ou próximo do domínio de treino (T1 ≈ 1 mm isotrópico)' + (meta.robustLog?.length ? ', com correção de campo de viés antes da conformação (ver Pipeline).' : '.'),
+    meta.motion ? `Movimento: os ${meta.motion.nVolumes} volumes da série foram registrados rigidamente (6 graus de liberdade, informação mútua, 2 passadas com referência média atualizada — análogo ao antsMotionCorr do ANTs) e promediados; deslocamento médio ${fmt(meta.motion.meanDisplacement, 2)} mm. Isso corrige movimento entre volumes; ghosting dentro de um volume único não é corrigível retrospectivamente no espaço da imagem.` : null,
     `Interpretação: nível ${quality.tier} (${quality.tierLabel}). Modelos MeshNet têm acurácia inferior à do recon-all/SynthSeg em estruturas pequenas (amígdala, accumbens, corno temporal) e em córtex fino; recomenda-se uso em estudos de grupo com covariáveis de aquisição (espessura, contraste, campo) e inspeção visual de cada caso. O volume intracraniano total (eTIV) não é estimado; normalize por parênquima total ou por eTIV externo.`,
-    'Referências: Masoud et al., brainchop: in-browser MRI volumetric segmentation (JOSS 2023); Fedorov et al., MeshNet (2017); Hanayik & Rorden, NiiVue; Li et al., dcm2niix (2016); Billot et al., SynthSeg (Med Image Anal 2023); Iglesias et al., SynthSR (Sci Adv 2023); Gopinath et al., recon-all-clinical (2024).'
+    'Referências: Masoud et al., brainchop: in-browser MRI volumetric segmentation (JOSS 2023); Fedorov et al., MeshNet (2017); Hanayik & Rorden, NiiVue; Li et al., dcm2niix (2016); Billot et al., SynthSeg (Med Image Anal 2023); Iglesias et al., SynthSR (Sci Adv 2023); Gopinath et al., recon-all-clinical (2024); Tustison et al., N4ITK (IEEE TMI 2010); Avants et al., ANTs (Insight J 2009).'
       + (hippo ? ' Hipocampo: DeKraker et al., HippUnfold (eLife 2022); Poppenk et al. (TiCS 2013); Wisse et al., nota de cautela sobre subcampos em T1 1 mm (HBM 2021); Sghirripa et al., comparação de métodos (HBM 2025); Iglesias et al., segmentHA (NeuroImage 2015); Yushkevich et al., ASHS (HBM 2015); Poiret et al., HSF (Front Neuroinform 2023).' : '')
   ]
-  for (const p of paras) y = pdf.paragraph(M, y, p, { size: 8.5, width: W, color: [60, 60, 60] }) + 4
+  for (const p of paras) { if (p) y = pdf.paragraph(M, y, p, { size: 8.5, width: W, color: [60, 60, 60] }) + 4 }
   footer()
   return pdf.build()
 }

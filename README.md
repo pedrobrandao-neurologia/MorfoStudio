@@ -8,7 +8,7 @@ Arquitetura inspirada no [brain2print](https://github.com/niivue/brain2print) e 
 |---|---|
 | DICOM → NIfTI | `dcm2niix` em WebAssembly (`@niivue/dcm2niix`), com seleção de série e leitura do sidecar JSON |
 | Régua de qualidade | `js/quality.js` — classifica o exame em A–D (voxel, anisotropia, nº de cortes, FOV, contraste, campo) e escolhe o ramo do pipeline |
-| Modo robusto | `js/preprocess-worker.js` — reamostragem cúbica (Catmull-Rom) dos eixos espessos, correção homomórfica de campo de viés, suavização opcional. Aproximação clássica do que SynthSR/SynthSeg fazem por rede |
+| Pré-processamento | `js/preprocess-worker.js` + `js/n4.js` + `js/motion-worker.js` — reamostragem cúbica dos eixos espessos, correção de campo de viés **N4 (ANTs-like)** ou homomórfica, correção de movimento entre volumes (registro rígido + média, estilo `antsMotionCorr`), suavização opcional; ver seção abaixo |
 | Segmentação | `js/brainchop-webworker.js` (MIT, brainchop) com modelos `aseg 18`, `aparc+aseg 50`, `aparc+aseg 104`, tecidos e máscara; backend WebGL ou CPU; modo baixa memória |
 | Estatísticas | `js/stats.js` — volume, %, intensidade, centroide RAS, hemisférios (rótulos L/R ou linha média), lobos de Desikan, cerebelo, tronco, ventrículos, corpo caloso, índice de assimetria |
 | Hipocampo | `js/hippocampus.js` + `js/hippocampus-worker.js` — refinamento da máscara, coordenadas longitudinais por equação de Laplace (método do HippUnfold) e parcelamento cabeça/corpo/cauda com morfometria; ver seção abaixo |
@@ -37,6 +37,36 @@ Ao alterar arquivos, mude `VERSION` em `sw.js` para invalidar o cache dos usuár
 - Não há estimativa de eTIV; normalize pelo parênquima total ou por eTIV externo.
 - Estruturas pequenas (amígdala, accumbens, corno temporal) têm erro maior; inspecione cada caso.
 - Uso em pesquisa; não substitui laudo.
+
+## Pré-processamento inspirado no ANTs
+
+Duas correções de artefato do [ANTs](https://github.com/ANTsX/ANTs) foram reimplementadas em JavaScript puro, a partir da leitura do código-fonte (`Examples/N4BiasFieldCorrection.cxx`, `Examples/antsMotionCorr.cxx` e os filtros ITK subjacentes):
+
+### Campo de viés (inomogeneidade) — N4, `js/n4.js`
+
+Reimplementação do algoritmo **N4ITK** (Tustison et al., IEEE TMI 2010; `itkN4BiasFieldCorrectionImageFilter`), o corretor de viés do ANTs:
+
+1. log-intensidade nos voxels da máscara (Otsu), subamostragem por média de blocos;
+2. a cada iteração, o histograma (200 bins, Parzen triangular) é **afiado por deconvolução de Wiener** com kernel gaussiano (FWHM 0,15, ruído 0,01 — os defaults do ANTs) e calcula-se o valor esperado E[u|v] da intensidade verdadeira;
+3. o resíduo v − E[u|v] é ajustado por **B-splines cúbicas** (aproximação de dados dispersos de Lee, Wolberg & Shin 1997, a mesma do `itkBSplineScatteredDataPointSetToImageFilter`, com a fórmula exata φ = Σ w·B²·(B·z/ΣB²) / Σ w·B²), e o lattice incremental é somado ao acumulado — a marca registrada do N4 sobre o N3;
+4. convergência pelo CV de exp(campo incremental); a grade de controle **dobra a cada nível** (refinamento multinível);
+5. o campo suave é reconstruído na resolução original e a imagem é dividida por exp(campo).
+
+Divergências deliberadas (validadas em fantomas sintéticos com campo conhecido — 97 % da variância de viés removida na cinzenta, correlação 0,90–0,99 com o campo verdadeiro):
+
+* **shrink por eixo** mirando ~4 mm efetivos (o fator fixo 4 do ANTs presume 1 mm isotrópico e produziria blocos de 20 mm em exames clínicos de corte espesso);
+* **filtros de pureza de bloco** (≥ 90 % acima do limiar de fundo; CV interno ≤ 12 %) — o volume parcial criado pela subamostragem contaminava o ajuste;
+* **3 níveis** de ajuste em vez de 4 (grade final ~50 mm: acima da escala da anatomia, abaixo da do viés; o 4º nível ajustava estrutura de tecido como se fosse campo);
+* convergência 0,001 (default do ITK; o CLI do ANTs roda todas as iterações com 0,0);
+* deconvolução por FFT radix-2 própria; convolução do E[u|v] no domínio direto.
+
+Disponível no modo robusto e, opcionalmente, no pipeline padrão ("Aplicar viés também no pipeline padrão"). O método homomórfico anterior permanece como alternativa rápida.
+
+### Movimento — registro rígido entre volumes, `js/motion-worker.js`
+
+No espírito do **`antsMotionCorr`**: quando a entrada é uma série 4D ou vários NIfTI do mesmo protocolo (aquisições repetidas), cada volume é registrado rigidamente (6 DOF) a uma referência e a **média dos volumes alinhados** segue para o pipeline. Fiel ao ANTs: winsorização [0,001–0,999]→[0,1] antes do registro (`PreprocessImage`), inicialização por centro de massa (`itkImageMomentsCalculator`), métrica **informação mútua de Mattes (32 bins)** em amostragem regular, escalas físicas de rotação pelo maior raio dos pontos (`RegistrationParameterScalesFromPhysicalShift`), duas passadas com referência média atualizada, reamostragem trilinear. Divergência deliberada: otimização por busca local coordenada multirresolução (shrink 4→2) em vez de gradiente conjugado com line search — dispensa o gradiente da MI e converge nos mesmos mínimos em volumes cerebrais (validado com transformações conhecidas: erro < 0,2 mm). Os parâmetros por volume (translações mm, rotações °, deslocamento resumido) vão para o JSON, a linha larga da coorte (`moco_*`) e o PDF.
+
+**Limite honesto**: isto corrige movimento **entre** volumes. Artefato de movimento **dentro** de um único volume 3D (ghosting, anéis) não é corrigível retrospectivamente no espaço da imagem — nem pelo ANTs (`antsMotionCorr` exige série temporal; o dano intra-volume está no k-space). Para esses casos, o caminho é readquirir ou usar correção prospectiva/da própria bobina.
 
 ## Segmentação hipocampal (cabeça · corpo · cauda)
 
@@ -76,7 +106,7 @@ Selecione *Modelo próprio (tfjs, URL)* e informe `model.json` + `labels.json` h
 
 ```
 index.html  styles.css  manifest.json  sw.js
-js/   app.js  quality.js  preprocess-worker.js  hippocampus.js  hippocampus-worker.js  stats.js  sav.js  pdf.js  report.js  zip.js  nifti-writer.js
+js/   app.js  quality.js  preprocess-worker.js  n4.js  motion-worker.js  hippocampus.js  hippocampus-worker.js  stats.js  sav.js  pdf.js  report.js  zip.js  nifti-writer.js
       brainchop-webworker.js  brainchop-parameters.js  tensor-utils.js  bwlabels.js   (brainchop, MIT)
 vendor/  niivue.min.js (NiiVue 0.69 ESM)  tf.fesm.min.js (TensorFlow.js 4.22)  dcm2niix/ (WASM)
 models/  model5_gw_ae  model20chan3cls  model30chan18cls  model30chan50cls  model21_104class
