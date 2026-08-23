@@ -73,6 +73,8 @@
     <section class="rail-section">
       <h3>Pré-processamento</h3>
       <label class="chk"><input type="checkbox" id="optMoco" checked> Corrigir movimento entre volumes (séries 4D / NIfTI repetidos)</label>
+      <label class="chk" title="Permutação/flip dos eixos pela affine, sem reamostrar — equivalente ao fslreorient2std"><input type="checkbox" id="optReorient" checked> Reorientar para RAS (≈ fslreorient2std)</label>
+      <label class="chk" title="Mantém 170 mm do topo da cabeça para baixo — heurística equivalente ao robustfov"><input type="checkbox" id="optCrop" checked> Recortar pescoço / FOV excessivo (≈ robustfov)</label>
       <label class="chk"><input type="checkbox" id="optBias" checked> Corrigir campo de viés (inomogeneidade)</label>
       <div class="field" style="margin:4px 0 0 22px">
         <select id="biasMethodSel" title="Método de correção de viés">
@@ -83,7 +85,13 @@
       <label class="chk"><input type="checkbox" id="optBiasStd"> Aplicar viés também no pipeline padrão</label>
       <label class="chk"><input type="checkbox" id="optResample" checked> Reamostrar cortes espessos (cúbica; modo robusto)</label>
       <label class="chk"><input type="checkbox" id="optDenoise"> Suavizar ruído (baixo campo)</label>
-      <p class="hint">Movimento: registro rígido 6-DOF + média, análogo ao <code>antsMotionCorr</code> (só corrige movimento <em>entre</em> volumes; ghosting dentro de um volume único exigiria o k-space). Viés: reimplementação do N4ITK (Tustison 2010) usado no ANTs, ou filtragem homomórfica rápida. Para exames muito fora do domínio, prefira <code>mri_synthseg --robust</code>/<code>recon-all-clinical</code> e importe o NIfTI aqui.</p>
+      <label class="chk" title="Máscara cerebral pelo modelo MeshNet + limpeza morfológica — equivalente ao BET"><input type="checkbox" id="optBet"> Extrair cérebro antes de segmentar (≈ BET)</label>
+      <div class="field" style="margin:4px 0 0 22px">
+        <label for="fBet">limiar f (0,1–0,9; maior = máscara menor, como o -f do BET)</label>
+        <input type="number" id="fBet" min="0.1" max="0.9" step="0.05" value="0.5">
+      </div>
+      <label class="chk" title="Reescala [p2,p98] dentro da máscara para [0,255] — análogo ao efeito do FAST -B"><input type="checkbox" id="optNorm"> Normalizar intensidade na máscara (≈ FAST -B)</label>
+      <p class="hint">Movimento ≈ <code>antsMotionCorr</code> (só entre volumes). Viés: N4 (ANTs) ou homomórfico, sempre <em>antes</em> da extração cerebral. Reorientação e recorte são heurísticas equivalentes a <code>fslreorient2std</code>/<code>robustfov</code>. A extração usa o modelo "Máscara cerebral" e sobrepõe a máscara para inspeção; atenção: os modelos MeshNet foram treinados em cabeça inteira — mascarar antes muda o domínio de entrada (útil sobretudo para tecidos SC/SB/líquor). Para SC/SB/líquor explícitos, use o atlas "Tecidos" (≈ FAST).</p>
     </section>
 
     <section class="rail-section">
@@ -150,6 +158,9 @@
         <button class="btn sm" data-export="pdf" disabled>PDF</button>
         <button class="btn sm" data-export="seg" disabled>Segmentação .nii.gz</button>
         <button class="btn sm" data-export="conf" disabled>Conformado .nii.gz</button>
+        <button class="btn sm" data-export="pre" disabled title="Volume nativo após reorientação/recorte/viés">Pré-proc .nii.gz</button>
+        <button class="btn sm" data-export="mask" disabled title="Máscara cerebral limpa (conformada)">Máscara .nii.gz</button>
+        <button class="btn sm" data-export="brain" disabled title="Volume conformado com a máscara aplicada">Cérebro .nii.gz</button>
         <button class="btn sm" data-export="src" disabled>NIfTI convertido</button>
         <button class="btn sm" data-export="zip" disabled>Pacote .zip</button>
       </div>

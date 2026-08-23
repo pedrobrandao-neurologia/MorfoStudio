@@ -10,7 +10,7 @@ import { detectContrast, assessQuality, renderRuler } from './quality.js'
 import { buildReport } from './report.js'
 import { hasHippocampus, runHippoWorker, buildHippoOverlay, hippoNiftiGz, hippoToCSV, hippoWideColumns, hippoColor } from './hippocampus.js'
 
-const VERSION = '0.3.0'
+const VERSION = '0.4.0'
 const $ = (id) => document.getElementById(id)
 
 // ids do brainchop-parameters.js (1-indexado): [memória alta, memória baixa]
@@ -27,6 +27,7 @@ const state = {
   nv: null, base: null, conformed: null, seg: null, labelsVol: null,
   source: null, quality: null, pipeline: 'padrao', contrast: 'desconhecido',
   result: null, meta: null, labelNames: null, colormap: null, modelKey: null, modelEntry: null, hippo: null, motion: null,
+  pre: null, bet: null,
   worker: null, preWorker: null, rejectPending: null, busy: false, cancelled: false, robustLog: [], cohort: [], gpuRenderer: ''
 }
 
@@ -54,6 +55,10 @@ function setExportsEnabled(on) {
   for (const b of document.querySelectorAll('#exportRow button')) b.disabled = !on
   $('btnAddCohort').disabled = !on
   $('exportRow').querySelector('[data-export="src"]').disabled = !(on && state.source?.convertedFile)
+  // intermediários de pré-processamento: só quando a etapa correspondente rodou
+  $('exportRow').querySelector('[data-export="pre"]').disabled = !(on && state.pre)
+  $('exportRow').querySelector('[data-export="mask"]').disabled = !(on && state.bet)
+  $('exportRow').querySelector('[data-export="brain"]').disabled = !(on && state.bet)
 }
 
 // ---------------------------------------------------------------- NiiVue
@@ -167,6 +172,8 @@ async function openNiftiFile(file, source = {}) {
     }
     if (!source.moco) state.motion = null
     state.base = vol; state.conformed = null; state.labelsVol = null; state.result = null
+    state.pre = null
+    resetBet()
     resetHippo()
     state.source = { kind: 'nifti', fileName: file.name, nFiles: 1, sidecar: {}, ...source }
     await showVolume(vol)
@@ -324,14 +331,18 @@ function volumeToFloat32in4D(vol, nvox, nt) {
   return out
 }
 
-function runPreprocess(vol, { allowResample = true } = {}) {
+function runPreprocess(vol, { allowResample = true, allowBias = true } = {}) {
   return new Promise((resolve, reject) => {
     const w = new Worker(new URL('./preprocess-worker.js', import.meta.url), { type: 'module' })
     state.preWorker = w
     state.rejectPending = reject
     const img = volumeToFloat32(vol)
     const dims = vol.hdr.dims.slice(1, 4), pixdims = vol.hdr.pixDims.slice(1, 4).map(Math.abs), affine = vol.hdr.affine.flat()
-    const options = { targetMM: 1.0, biasCorrect: $('optBias').checked, biasMethod: $('biasMethodSel').value, denoise: $('optDenoise').checked }
+    const options = {
+      targetMM: 1.0, biasCorrect: $('optBias').checked && allowBias, biasMethod: $('biasMethodSel').value,
+      denoise: $('optDenoise').checked && allowResample,
+      reorient: $('optReorient').checked, cropNeck: $('optCrop').checked
+    }
     if (!$('optResample').checked || !allowResample) options.targetMM = 1e9
     w.onmessage = async (e) => {
       const m = e.data
@@ -345,8 +356,10 @@ function runPreprocess(vol, { allowResample = true } = {}) {
         const sc = mx > 0 ? 32000 / mx : 1
         const i16 = new Int16Array(m.img.length)
         for (let i = 0; i < i16.length; i++) i16[i] = Math.round(m.img[i] * sc)
-        const buf = writeNifti({ dims: m.dims, pixdims: m.pixdims, affine: m.affine, dtype: 'int16', data: i16, sclSlope: 1 / sc, description: 'Morfo robusto' })
-        const nvi = await NVImage.new(buf, 'robusto.nii')
+        const buf = writeNifti({ dims: m.dims, pixdims: m.pixdims, affine: m.affine, dtype: 'int16', data: i16, sclSlope: 1 / sc, description: 'Morfo pre-processado' })
+        // intermediário exportável + proveniência
+        state.pre = { buf, prov: m.prov || {}, log: m.log }
+        const nvi = await NVImage.new(buf.slice(0), 'preprocessado.nii')
         resolve(nvi)
       }
     }
@@ -380,7 +393,7 @@ function cancelSegmentation() {
   if (state.rejectPending) { const r = state.rejectPending; state.rejectPending = null; r(new Error('cancelado')) }
 }
 
-function runInference(conf, modelSel, opts) {
+function runInference(conf, modelSel, opts, imgOverride) {
   return new Promise((resolve, reject) => {
     const w = new Worker(new URL('./brainchop-webworker.js', import.meta.url), { type: 'module' })
     state.worker = w
@@ -394,8 +407,72 @@ function runInference(conf, modelSel, opts) {
       } else if (m.cmd === 'img') { w.terminate(); state.worker = null; resolve(new Uint8Array(m.img)) }
     }
     w.onerror = (e) => { w.terminate(); state.worker = null; reject(new Error(e.message || 'worker de inferência falhou')) }
-    w.postMessage({ opts, modelEntry: modelSel.entry, niftiHeader: { datatypeCode: conf.hdr.datatypeCode, dims: conf.hdr.dims }, niftiImage: conf.img })
+    w.postMessage({ opts, modelEntry: modelSel.entry, niftiHeader: { datatypeCode: conf.hdr.datatypeCode, dims: conf.hdr.dims }, niftiImage: imgOverride || conf.img })
   })
+}
+
+// ---------------------------------------------------------------- extração cerebral (≈ BET)
+function runMaskWorker({ prob, intensity, dims, f, normalize }) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./mask-worker.js', import.meta.url), { type: 'module' })
+    state.preWorker = w
+    state.rejectPending = reject
+    w.onmessage = (e) => {
+      const m = e.data
+      if (m.cmd === 'progress') { log(m.message); progress(0.9 + 0.05 * (m.frac || 0)) }
+      else if (m.cmd === 'error') { w.terminate(); state.preWorker = null; reject(new Error(m.message)) }
+      else if (m.cmd === 'done') { w.terminate(); state.preWorker = null; resolve(m) }
+    }
+    w.onerror = (e) => { w.terminate(); state.preWorker = null; reject(new Error(e.message || 'worker de máscara falhou')) }
+    w.postMessage({ prob, intensity: Uint8Array.from(intensity), dims, f, normalize }, [prob.buffer])
+  })
+}
+
+/** modo mock: pseudo-probabilidade de cérebro a partir da intensidade conformada */
+function mockBrainProb(conf) {
+  const prob = new Uint8Array(conf.img.length)
+  for (let i = 0; i < prob.length; i++) prob[i] = Math.min(255, conf.img[i] * 1.6)
+  return prob
+}
+
+function resetBet() {
+  if (state.bet?.overlay && state.nv) { try { state.nv.removeVolume(state.bet.overlay) } catch { /* já removido */ } }
+  state.bet = null
+}
+
+/** roda máscara MeshNet (probabilidade via isScalar) + limpeza; devolve {mask, brain} e faz QC overlay */
+async function runBrainExtraction(conf, opts) {
+  const mockMode = new URLSearchParams(location.search).has('mock')
+  let prob
+  if (mockMode) {
+    log('MOCK: máscara cerebral por limiar de intensidade')
+    prob = mockBrainProb(conf)
+  } else {
+    log('Extração cerebral (≈ BET): inferindo probabilidade de cérebro…')
+    const maskEntry = JSON.parse(JSON.stringify(inferenceModelsList[11])) // id 12 — Brain Mask (FAST)
+    maskEntry.isScalar = true // devolve softmax de "cérebro" (0–255) em vez do argmax
+    maskEntry.type = 'Segmentation' // evita a binarização do caminho Brain_Masking
+    maskEntry.isNvidia = /nvidia/i.test(state.gpuRenderer)
+    prob = await runInference(conf, { entry: maskEntry, key: 'mask-prob' }, opts)
+  }
+  if (state.cancelled) throw new Error('cancelado')
+  const f = Math.max(0.1, Math.min(0.9, Number($('fBet').value) || 0.5))
+  const m = await runMaskWorker({ prob, intensity: conf.img, dims: [256, 256, 256], f, normalize: $('optNorm').checked })
+  state.bet = { mask: new Uint8Array(m.mask), brain: new Uint8Array(m.brain), f, voxels: m.voxels, normalized: !!m.normalized, cleanupLog: m.log }
+  // QC: sobrepõe a máscara no visualizador (controlada pelo slider de opacidade)
+  const overlay = conf.clone()
+  overlay.zeroImage()
+  overlay.hdr.scl_inter = 0; overlay.hdr.scl_slope = 1
+  overlay.img = state.bet.mask
+  overlay.hdr.intent_code = 1002
+  overlay.setColormapLabel({ R: [0, 214], G: [0, 65], B: [0, 82], labels: ['BG', 'mascara'] })
+  overlay.opacity = Math.min(0.4, Number($('opacity').value) || 0.4)
+  overlay.name = 'mascara-cerebral'
+  await state.nv.addVolume(overlay)
+  state.bet.overlay = overlay
+  log(`Máscara cerebral: ${fmt(m.voxels / 1000, 0)} cm³ (f=${f}${state.bet.normalized ? ', intensidade normalizada na máscara' : ''}) — sobreposta para inspeção`)
+  if (m.voxels < 400000) log(`⚠ Máscara pequena (${fmt(m.voxels / 1000, 0)} cm³; típico 1100–1700). Considere reduzir o limiar f.`)
+  return state.bet
 }
 
 async function finishSegmentation({ conf, labels, modelSel, backend, t0 }) {
@@ -436,6 +513,16 @@ async function finishSegmentation({ conf, labels, modelSel, backend, t0 }) {
     dims: state.base.hdr.dims.slice(1, 4), vox: q.vox, voxMin: q.voxMin, voxMax: q.voxMax, nSlices: q.nSlices, contrast: q.contrast,
     qualityTier: q.tier, pipeline: state.pipeline, robustLog: state.robustLog, modelKey: modelSel.key, modelLabel: modelSel.label,
     motion: state.motion ? { nVolumes: state.motion.nVolumes, meanDisplacement: state.motion.meanDisplacement, params: state.motion.params } : null,
+    // proveniência: quais etapas de pré-processamento rodaram e com quais parâmetros
+    preproc: {
+      motionCorrection: state.motion ? { applied: true, nVolumes: state.motion.nVolumes, meanDisplacement_mm: state.motion.meanDisplacement } : { applied: false },
+      reorientRAS: state.pre?.prov?.reorient || { applied: false },
+      neckCrop: state.pre?.prov?.neckCrop || { applied: false },
+      biasCorrection: state.pre?.prov?.bias || { applied: false },
+      brainExtraction: state.bet
+        ? { applied: true, f: state.bet.f, mask_cm3: state.bet.voxels / 1000, normalizedWithinMask: state.bet.normalized, cleanup: state.bet.cleanupLog }
+        : { applied: false }
+    },
     backend, elapsedS: ((performance.now() - t0) / 1000).toFixed(1), processedAt: nowStamp(), app: `Morfo Studio ${VERSION}`
   }
   renderStats()
@@ -549,13 +636,17 @@ async function runSegmentation() {
     const nv = state.nv
     let vol = state.base
     state.robustLog = []
-    if (state.pipeline === 'robusto') {
-      log('Modo robusto: pré-processando…'); progress(0.05)
-      vol = await runPreprocess(vol)
-    } else if ($('optBias').checked && $('optBiasStd').checked) {
-      // pipeline padrão com correção de viés explícita (sem reamostragem)
-      log('Corrigindo campo de viés antes de conformar…'); progress(0.05)
-      vol = await runPreprocess(vol, { allowResample: false })
+    state.pre = null
+    resetBet()
+    // pré-processamento nativo: sempre que qualquer etapa estiver ligada
+    // (reorientação/recorte/viés no padrão; no robusto inclui reamostragem)
+    const needsPre = state.pipeline === 'robusto' || $('optReorient').checked || $('optCrop').checked || ($('optBias').checked && $('optBiasStd').checked)
+    if (needsPre) {
+      log('Pré-processando (reorientação, recorte, viés)…'); progress(0.05)
+      vol = await runPreprocess(vol, {
+        allowResample: state.pipeline === 'robusto',
+        allowBias: state.pipeline === 'robusto' || $('optBiasStd').checked
+      })
     }
     if (state.cancelled) throw new Error('cancelado')
     log('Conformando para 256³ a 1 mm…'); progress(0.28)
@@ -568,7 +659,15 @@ async function runSegmentation() {
     opts.rootURL = new URL('.', location.href).href.replace(/\/$/, '')
     opts.backend = $('backendSel').value
     opts.telemetryFlag = false
-    const labels = new URLSearchParams(location.search).has('mock') ? await mockLabels(conf, modelSel.entry) : await runInference(conf, modelSel, opts)
+    // ---- extração cerebral (≈ BET) antes da segmentação, sobre o volume conformado já corrigido
+    let infImg = null
+    if ($('optBet').checked && modelSel.key !== 'mask') {
+      await runBrainExtraction(conf, opts)
+      if (state.cancelled) throw new Error('cancelado')
+      infImg = state.bet.brain
+      progress(0.3)
+    }
+    const labels = new URLSearchParams(location.search).has('mock') ? await mockLabels(conf, modelSel.entry, infImg) : await runInference(conf, modelSel, opts, infImg)
     if (state.cancelled) throw new Error('cancelado')
     await finishSegmentation({ conf, labels, modelSel, backend: opts.backend, t0 })
   } catch (e) {
@@ -582,14 +681,15 @@ async function runSegmentation() {
   }
 }
 // ?mock=1 — rótulos sintéticos (bandas de intensidade × posição) para testar painéis/exportações sem GPU
-async function mockLabels(conf, entry) {
+async function mockLabels(conf, entry, imgOverride) {
   log('MOCK: gerando rótulos sintéticos (sem inferência)')
+  const src = imgOverride || conf.img
   const names = entry.labelsPath ? await fetchJSON(entry.labelsPath) : { 0: 'BG', 1: 'Brain' }
   const ids = Object.keys(names).map(Number).filter((k) => k > 0)
   const out = new Uint8Array(conf.img.length)
   const n = 256, third = Math.max(1, Math.floor(ids.length / 3))
   for (let z = 0; z < n; z++) for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
-    const i = x + y * n + z * n * n, v = conf.img[i]
+    const i = x + y * n + z * n * n, v = src[i]
     if (v < 40) continue
     const band = v < 90 ? 0 : v < 170 ? 1 : 2
     const sector = ((x >> 5) * 3 + (y >> 6) + (z >> 6) * 5) % third
@@ -677,6 +777,16 @@ async function confNiftiGz() {
   const buf = writeNifti({ dims: [256, 256, 256], pixdims: [1, 1, 1], affine: c.hdr.affine.flat(), dtype: 'uint8', data: c.img, description: 'Morfo conformado 256 1mm' })
   return gzipBlob(buf)
 }
+async function maskNiftiGz() {
+  const c = state.conformed
+  const buf = writeNifti({ dims: [256, 256, 256], pixdims: [1, 1, 1], affine: c.hdr.affine.flat(), dtype: 'uint8', data: state.bet.mask, intent: 1002, description: `Morfo mascara cerebral f=${state.bet.f}` })
+  return gzipBlob(buf)
+}
+async function brainNiftiGz() {
+  const c = state.conformed
+  const buf = writeNifti({ dims: [256, 256, 256], pixdims: [1, 1, 1], affine: c.hdr.affine.flat(), dtype: 'uint8', data: state.bet.brain, description: 'Morfo cerebro extraido' })
+  return gzipBlob(buf)
+}
 async function doExport(kind) {
   const base = `${state.meta?.subjectId || 'morfo'}_${state.modelKey || ''}_${fileStamp()}`
   try {
@@ -690,6 +800,9 @@ async function doExport(kind) {
         download(new Blob([bytes], { type: 'application/pdf' }), `${base}_relatorio.pdf`); break
       }
       case 'seg': download(await segNiftiGz(), `${base}_seg.nii.gz`); break
+      case 'pre': if (state.pre) download(await gzipBlob(state.pre.buf), `${base}_preproc.nii.gz`); break
+      case 'mask': if (state.bet) download(await maskNiftiGz(), `${base}_mascara.nii.gz`); break
+      case 'brain': if (state.bet) download(await brainNiftiGz(), `${base}_cerebro.nii.gz`); break
       case 'hippo-csv': if (state.hippo) download(new Blob([hippoToCSV(state.hippo.result, state.meta)], { type: 'text/csv' }), `${base}_hipocampo.csv`); break
       case 'hippo-nii': if (state.hippo) download(await hippoNiftiGz(state.conformed, state.hippo.labels), `${base}_hipocampo.nii.gz`); break
       case 'conf': download(await confNiftiGz(), `${base}_conformado.nii.gz`); break
@@ -704,6 +817,11 @@ async function doExport(kind) {
           { name: `${base}_seg.nii.gz`, data: new Uint8Array(await (await segNiftiGz()).arrayBuffer()) },
           { name: `${base}_conformado.nii.gz`, data: new Uint8Array(await (await confNiftiGz()).arrayBuffer()) }
         ]
+        if (state.pre) entries.push({ name: `${base}_preproc.nii.gz`, data: new Uint8Array(await (await gzipBlob(state.pre.buf)).arrayBuffer()) })
+        if (state.bet) {
+          entries.push({ name: `${base}_mascara.nii.gz`, data: new Uint8Array(await (await maskNiftiGz()).arrayBuffer()) })
+          entries.push({ name: `${base}_cerebro.nii.gz`, data: new Uint8Array(await (await brainNiftiGz()).arrayBuffer()) })
+        }
         if (state.hippo) {
           entries.push({ name: `${base}_hipocampo.csv`, data: new TextEncoder().encode(hippoToCSV(state.hippo.result, state.meta)) })
           entries.push({ name: `${base}_hipocampo.nii.gz`, data: new Uint8Array(await (await hippoNiftiGz(state.conformed, state.hippo.labels)).arrayBuffer()) })
@@ -783,7 +901,7 @@ function bind() {
   $('opacity').oninput = (e) => {
     const op = Number(e.target.value)
     let changed = false
-    state.nv.volumes.forEach((v, i) => { if (v === state.labelsVol || v === state.hippo?.overlay) { state.nv.setOpacity(i, op); changed = true } })
+    state.nv.volumes.forEach((v, i) => { if (v === state.labelsVol || v === state.hippo?.overlay || v === state.bet?.overlay) { state.nv.setOpacity(i, op); changed = true } })
     if (changed) state.nv.updateGLVolume()
   }
   $('layoutSel').onchange = (e) => {
