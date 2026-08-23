@@ -10,6 +10,7 @@
 // 'homomorfico' (filtragem homomórfica rápida, implementada abaixo).
 
 import { n4BiasCorrect } from './n4.js'
+import { reorientToRAS, cropNeck } from './fsl-prep.js'
 
 function post(msg, transfer) { self.postMessage(msg, transfer || []) }
 function progress(msg, frac) { post({ cmd: 'progress', message: msg, frac }) }
@@ -141,8 +142,25 @@ self.onmessage = (e) => {
   const { img, dims, pixdims, affine, options } = e.data
   try {
     let cur = new Float32Array(img), curDims = [...dims], curPix = [...pixdims]
-    const curAffine = [...affine]
+    let curAffine = [...affine]
     const log = []
+    const prov = {}
+    // 0a. reorientação canônica RAS (≈ fslreorient2std): permutação/flip, sem reamostrar
+    if (options.reorient) {
+      progress('Reorientação canônica (RAS)', 0.03)
+      const r = reorientToRAS(cur, curDims, curPix, curAffine)
+      prov.reorient = { applied: r.applied, from: r.orientation }
+      if (r.applied) { cur = r.img; curDims = r.dims; curPix = r.pixdims; curAffine = r.affine }
+      log.push(r.log)
+    }
+    // 0b. recorte de pescoço (≈ robustfov): mantém keepMM do topo da cabeça para baixo
+    if (options.cropNeck) {
+      progress('Recorte de pescoço (FOV robusto)', 0.06)
+      const c = cropNeck({ img: cur, dims: curDims, pixdims: curPix, affine: curAffine, keepMM: options.cropKeepMM || 170 })
+      prov.neckCrop = { applied: c.applied, removedSlices: c.removedSlices, removedMM: c.removedMM, keepMM: options.cropKeepMM || 170 }
+      if (c.applied) { cur = c.img; curDims = c.dims; curAffine = c.affine }
+      log.push(c.log)
+    }
     // 1. reamostragem dos eixos espessos
     const target = Math.max(options.targetMM || 1.0, Math.min(...pixdims))
     for (let axis = 0; axis < 3; axis++) {
@@ -158,17 +176,21 @@ self.onmessage = (e) => {
         log.push(`eixo ${'xyz'[axis]}: ${pixdims[axis].toFixed(2)} → ${curPix[axis].toFixed(2)} mm (Catmull-Rom)`)
       }
     }
-    // 2/3. campo de viés: N4 (ANTs-like) ou homomórfico
+    // 2/3. campo de viés: N4 (ANTs-like) ou homomórfico — roda sobre a imagem já reorientada/recortada,
+    // ANTES da extração cerebral (a máscara MeshNet é inferida depois, sobre o volume conformado corrigido)
     if (options.biasCorrect !== false) {
+      prov.bias = { method: options.biasMethod || 'n4' }
       if ((options.biasMethod || 'n4') === 'n4') {
         progress('Correção de campo de viés N4 (ANTs-like)', 0.6)
         const b = n4BiasCorrect(cur, curDims, curPix, options.n4 || {}, (msg, frac) => progress(msg, 0.6 + 0.2 * (frac || 0)))
         cur = b.img
+        prov.bias.applied = b.applied
         log.push(...(b.applied ? b.log : ['N4: máscara insuficiente, etapa ignorada']))
       } else {
         progress('Correção homomórfica de campo de viés', 0.6)
         const b = biasCorrect(cur, curDims, curPix, options.biasSigmaMM || 30)
         cur = b.img
+        prov.bias.applied = b.applied
         log.push(b.applied ? `campo de viés corrigido (homomórfico, σ≈${options.biasSigmaMM || 30} mm)` : 'campo de viés: máscara insuficiente, etapa ignorada')
       }
     }
@@ -179,7 +201,7 @@ self.onmessage = (e) => {
       log.push('suavização 3D (box 3×3×3)')
     }
     progress('Pré-processamento concluído', 1)
-    post({ cmd: 'done', img: cur, dims: curDims, pixdims: curPix, affine: curAffine, log }, [cur.buffer])
+    post({ cmd: 'done', img: cur, dims: curDims, pixdims: curPix, affine: curAffine, log, prov }, [cur.buffer])
   } catch (err) {
     post({ cmd: 'error', message: err.message || String(err) })
   }

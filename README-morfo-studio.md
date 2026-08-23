@@ -8,7 +8,7 @@ Arquitetura inspirada no [brain2print](https://github.com/niivue/brain2print) e 
 |---|---|
 | DICOM → NIfTI | `dcm2niix` em WebAssembly (`@niivue/dcm2niix`), com seleção de série e leitura do sidecar JSON |
 | Régua de qualidade | `js/quality.js` — classifica o exame em A–D (voxel, anisotropia, nº de cortes, FOV, contraste, campo) e escolhe o ramo do pipeline |
-| Pré-processamento | `js/preprocess-worker.js` + `js/n4.js` + `js/motion-worker.js` — reamostragem cúbica dos eixos espessos, correção de campo de viés **N4 (ANTs-like)** ou homomórfica, correção de movimento entre volumes (registro rígido + média, estilo `antsMotionCorr`), suavização opcional; ver seção abaixo |
+| Pré-processamento | `js/preprocess-worker.js` + `js/fsl-prep.js` + `js/n4.js` + `js/motion-worker.js` + `js/mask-worker.js` — reorientação RAS (≈ `fslreorient2std`), recorte de pescoço (≈ `robustfov`), viés **N4 (ANTs-like)** ou homomórfico, movimento entre volumes (≈ `antsMotionCorr`), extração cerebral com limiar f (≈ `BET`), normalização na máscara (≈ `FAST -B`), reamostragem cúbica; ver seções abaixo |
 | Segmentação | `js/brainchop-webworker.js` (MIT, brainchop) com modelos `aseg 18`, `aparc+aseg 50`, `aparc+aseg 104`, tecidos e máscara; backend WebGL ou CPU; modo baixa memória |
 | Estatísticas | `js/stats.js` — volume, %, intensidade, centroide RAS, hemisférios (rótulos L/R ou linha média), lobos de Desikan, cerebelo, tronco, ventrículos, corpo caloso, índice de assimetria |
 | Hipocampo | `js/hippocampus.js` + `js/hippocampus-worker.js` — refinamento da máscara, coordenadas longitudinais por equação de Laplace (método do HippUnfold) e parcelamento cabeça/corpo/cauda com morfometria; ver seção abaixo |
@@ -37,6 +37,24 @@ Ao alterar arquivos, mude `VERSION` em `sw.js` para invalidar o cache dos usuár
 - Não há estimativa de eTIV; normalize pelo parênquima total ou por eTIV externo.
 - Estruturas pequenas (amígdala, accumbens, corno temporal) têm erro maior; inspecione cada caso.
 - Uso em pesquisa; não substitui laudo.
+
+## Pré-processamento estilo FSL
+
+As etapas estruturais clássicas do FSL têm equivalentes navegador na seção **Pré-processamento** do painel, encadeadas nesta ordem no pipeline (movimento → reorientação → recorte → viés → conformação → extração cerebral → normalização → segmentação):
+
+| Etapa | Equivalente FSL | Implementação | Observações |
+|---|---|---|---|
+| Reorientação canônica | `fslreorient2std` | `js/fsl-prep.js reorientToRAS` — permutação/flip de eixos pela affine, **sem reamostrar**, no espaço nativo | A conformação do NiiVue já reorienta *implicitamente* ao reamostrar para 256³; esta etapa torna a orientação explícita e testável antes das demais (o N4 por eixo e o recorte dependem dela) |
+| Recorte de pescoço | `robustfov` | `cropNeck` — perfil de área de primeiro plano (Otsu) no eixo inferior-superior detectado pela affine; mantém **170 mm** do topo da cabeça (o default do robustfov) | Heurística ≠ robustfov exato (que usa um modelo de FOV); no-op quando o FOV já é pequeno |
+| Correção de viés | (FSL usa o FAST -B) | o **N4 já existente** (`js/n4.js`) roda **antes** da extração cerebral, e a imagem corrigida alimenta todas as etapas seguintes | ver seção ANTs abaixo |
+| Extração cerebral | `BET` | modelo MeshNet "Máscara cerebral" com saída de **probabilidade** (softmax via `isScalar` do brainchop) + limiar **f configurável (0,1–0,9, default 0,5** — análogo ao `-f`; maior = máscara menor**)** + fechamento morfológico, maior componente 26-conexo e preenchimento de cavidades (`js/mask-worker.js`) | A máscara é sobreposta no NiiVue (slider de opacidade) para QC antes de confiar na segmentação; máscara e cérebro extraído exportáveis |
+| Contraste SC/SB | efeito do `FAST -B` + segmentação | (a) normalização opcional `[p2,p98]→[0,255]` dentro da máscara (`normalizeWithinMask`); (b) segmentação SC/SB/líquor pelo modelo **tissue_3** existente (atlas "Tecidos"), com volumes no painel de estatísticas como sempre | Atenção: os modelos MeshNet foram treinados em **cabeça inteira** conformada — mascarar/normalizar antes muda o domínio de entrada; útil sobretudo para tecidos, use com inspeção |
+
+Proveniência: o JSON exportado registra em `meta.preproc` quais etapas rodaram e com quais parâmetros (orientação original, cortes removidos, método de viés, f da máscara, volume da máscara, normalização). Os intermediários (pré-processado nativo, máscara, cérebro extraído) saem como `.nii.gz` nos botões de exportação e no pacote `.zip`.
+
+### Por que não o niimath (WASM)?
+
+Avaliamos integrar o [niimath](https://github.com/rordenlab/niimath) (clone do fslmaths em WASM, BSD-2, `@niivue/niimath`, ~723 KB somando wasm + JS): ele **tem** `-robustfov` exato e morfologia rica, mas **não tem** `fslreorient2std` sem reamostragem (só `-conform`, que reamostra) nem extração cerebral. Como a reorientação teria de ser JS puro de qualquer forma, a morfologia já existia no projeto (módulo hipocampal) e o único ganho seria o robustfov exato, optamos por ~150 linhas de JS puro testáveis em vez de +723 KB de assets e uma dependência nova no cache offline. Se o projeto vier a precisar de operações fslmaths genéricas, o niimath é a escolha natural (mesmos mantenedores do NiiVue).
 
 ## Pré-processamento inspirado no ANTs
 
@@ -106,7 +124,7 @@ Selecione *Modelo próprio (tfjs, URL)* e informe `model.json` + `labels.json` h
 
 ```
 index.html  styles.css  manifest.json  sw.js
-js/   app.js  quality.js  preprocess-worker.js  n4.js  motion-worker.js  hippocampus.js  hippocampus-worker.js  stats.js  sav.js  pdf.js  report.js  zip.js  nifti-writer.js
+js/   app.js  quality.js  preprocess-worker.js  fsl-prep.js  mask-worker.js  n4.js  motion-worker.js  hippocampus.js  hippocampus-worker.js  stats.js  sav.js  pdf.js  report.js  zip.js  nifti-writer.js
       brainchop-webworker.js  brainchop-parameters.js  tensor-utils.js  bwlabels.js   (brainchop, MIT)
 vendor/  niivue.min.js (NiiVue 0.69 ESM)  tf.fesm.min.js (TensorFlow.js 4.22)  dcm2niix/ (WASM)
 models/  model5_gw_ae  model20chan3cls  model30chan18cls  model30chan50cls  model21_104class
