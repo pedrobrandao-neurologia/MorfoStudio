@@ -1,5 +1,5 @@
 // sw.js — cache offline do Morfo Studio (app shell + vendor + modelos + fontes)
-const VERSION = 'morfo-v0.1.0'
+const VERSION = 'morfo-v0.2.0'
 const PRECACHE = [
   "./fonts/archivo-wdth.woff2",
   "./fonts/jetbrains-mono.woff2",
@@ -12,6 +12,8 @@ const PRECACHE = [
   "./js/brainchop-parameters.js",
   "./js/brainchop-webworker.js",
   "./js/bwlabels.js",
+  "./js/hippocampus-worker.js",
+  "./js/hippocampus.js",
   "./js/nifti-writer.js",
   "./js/pdf.js",
   "./js/preprocess-worker.js",

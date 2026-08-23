@@ -122,6 +122,17 @@
       <div id="statsBody"><p class="empty">Nenhuma segmentação ainda.</p></div>
     </section>
 
+    <section class="panel" id="panelHippo">
+      <h3>Hipocampo</h3>
+      <div id="hippoBody"><p class="empty">Após segmentar com um modelo que rotule o hipocampo (aseg / aparc+aseg), esta análise refina a máscara e a divide em <b>cabeça · corpo · cauda</b> por um sistema de coordenadas longitudinal (equação de Laplace, método do HippUnfold). Em T1 ~1 mm não há contraste para subcampos (CA1–CA4, GD, subículo) — ver README.</p></div>
+      <label class="chk" style="margin-top:6px"><input type="checkbox" id="hippoRefine" checked> Refinar máscara por intensidade</label>
+      <div class="btn-row" style="margin-top:6px">
+        <button class="btn sm primary" id="btnHippo" disabled>Analisar hipocampo</button>
+        <button class="btn sm" data-export="hippo-csv" disabled>CSV</button>
+        <button class="btn sm" data-export="hippo-nii" disabled>Subregiões .nii.gz</button>
+      </div>
+    </section>
+
     <section class="panel" id="panelExport">
       <h3>Exportar</h3>
       <div class="btn-row" id="exportRow">
