@@ -5,7 +5,7 @@ const INK = [30, 34, 41], BONE = [232, 227, 217], MUTED = [110, 116, 128], DARK 
 const TIER_COLOR = { A: [63, 163, 77], B: [109, 159, 58], C: [230, 148, 34], D: [205, 62, 78] }
 const fmt = (v, d = 0) => (v == null || Number.isNaN(v) ? '—' : Number(v).toLocaleString('pt-BR', { minimumFractionDigits: d, maximumFractionDigits: d }))
 
-export function buildReport({ meta, quality, result, snapshot, modelInfo }) {
+export function buildReport({ meta, quality, result, snapshot, modelInfo, hippo }) {
   const pdf = new MiniPDF()
   const M = 40, W = 595.28 - 2 * M
   let page = 0
@@ -133,6 +133,44 @@ export function buildReport({ meta, quality, result, snapshot, modelInfo }) {
       y += 10.5
     }
   }
+  // ---------- hipocampo (subregiões pelo eixo longitudinal)
+  if (hippo && (hippo.left || hippo.right)) {
+    y = ensure(y + 14, 120)
+    pdf.text(M, y, 'Hipocampo — subregiões pelo eixo longitudinal', { size: 11, bold: true }); y += 12
+    pdf.rect(M, y - 9, W, 13, [236, 236, 236])
+    const hc = [['Hemisfério / parte', M + 4, 'left'], ['Volume mm³', M + 260, 'right'], ['Compr. mm', M + 340, 'right'], ['Diâm. eq. mm', M + 410, 'right'], ['Superf. mm²', M + 480, 'right']]
+    for (const [l, x, al] of hc) pdf.text(x, y, l, { size: 7.5, bold: true, align: al, color: [60, 60, 60] })
+    y += 12
+    const partPT = { head: 'cabeça', body: 'corpo', tail: 'cauda' }
+    for (const [key, label] of [['left', 'Esquerdo'], ['right', 'Direito']]) {
+      const s = hippo[key]
+      if (!s) continue
+      if (y + 50 > 790) { footer(); y = header() }
+      pdf.text(M + 4, y, `${label} — total`, { size: 7.5, bold: true })
+      pdf.text(hc[1][1], y, fmt(s.volume_mm3), { size: 7.5, align: 'right', bold: true })
+      pdf.text(hc[2][1], y, fmt(s.axis_length_mm, 1), { size: 7.5, align: 'right' })
+      pdf.text(hc[3][1], y, fmt(s.eq_diameter_mm, 1), { size: 7.5, align: 'right' })
+      pdf.text(hc[4][1], y, fmt(s.surface_mm2), { size: 7.5, align: 'right' })
+      y += 10.5
+      for (const p of ['head', 'body', 'tail']) {
+        const P = s[p]
+        pdf.text(M + 16, y, partPT[p], { size: 7.5, color: [60, 60, 60] })
+        pdf.text(hc[1][1], y, fmt(P.volume_mm3), { size: 7.5, align: 'right' })
+        pdf.text(hc[2][1], y, fmt(P.length_mm, 1), { size: 7.5, align: 'right' })
+        pdf.text(hc[3][1], y, fmt(P.eq_diameter_mm, 1), { size: 7.5, align: 'right' })
+        y += 10.5
+      }
+      pdf.line(M, y - 4, M + W, y - 4, [232, 232, 232], 0.4)
+    }
+    if (hippo.asymmetry?.total_pct != null) {
+      const a = hippo.asymmetry
+      y = pdf.paragraph(M, y + 2, `Assimetria 2(E−D)/(E+D)×100: total ${fmt(a.total_pct, 1)} % · cabeça ${fmt(a.head_pct, 1)} · corpo ${fmt(a.body_pct, 1)} · cauda ${fmt(a.tail_pct, 1)}.`, { size: 8.5, width: W, color: [60, 60, 60] })
+    }
+    const flags = [...(hippo.left?.qc_flags || []).map((x) => 'E: ' + x), ...(hippo.right?.qc_flags || []).map((x) => 'D: ' + x)]
+    for (const fl of flags) { y = ensure(y, 12); y = pdf.paragraph(M, y, '(!) ' + fl, { size: 8, width: W, color: TIER_COLOR.C }) }
+    y = pdf.paragraph(M, y + 2, `Método: máscara do rótulo "Hippocampus" ${hippo.options?.refine ? 'refinada por modelo de intensidade robusto (mediana ± k·MAD), fechamento morfológico e maior componente conexo, ' : ''}dividida em cabeça/corpo/cauda por um campo de coordenadas longitudinal — equação de Laplace resolvida no interior da máscara (abordagem do HippUnfold), reparametrizada por comprimento de arco (cortes em ${Math.round((hippo.options?.headFrac ?? 1 / 3) * 100)} % e ${Math.round((hippo.options?.tailFrac ?? 2 / 3) * 100)} %, divisão proporcional da convenção de marcos de Poppenk et al. 2013). São subregiões geométricas, não subcampos histológicos (CA1–CA4, GD, subículo exigem T2 dedicado ou modelos treinados — HippUnfold, HSF, ASHS, FreeSurfer segmentHA).`, { size: 8, width: W, color: MUTED })
+  }
+
   // ---------- métodos e ressalvas
   y = ensure(y + 14, 140)
   pdf.text(M, y, 'Métodos e ressalvas', { size: 11, bold: true }); y += 12
@@ -143,6 +181,7 @@ export function buildReport({ meta, quality, result, snapshot, modelInfo }) {
       : 'Ramo padrão: o exame está dentro ou próximo do domínio de treino (T1 ≈ 1 mm isotrópico).',
     `Interpretação: nível ${quality.tier} (${quality.tierLabel}). Modelos MeshNet têm acurácia inferior à do recon-all/SynthSeg em estruturas pequenas (amígdala, accumbens, corno temporal) e em córtex fino; recomenda-se uso em estudos de grupo com covariáveis de aquisição (espessura, contraste, campo) e inspeção visual de cada caso. O volume intracraniano total (eTIV) não é estimado; normalize por parênquima total ou por eTIV externo.`,
     'Referências: Masoud et al., brainchop: in-browser MRI volumetric segmentation (JOSS 2023); Fedorov et al., MeshNet (2017); Hanayik & Rorden, NiiVue; Li et al., dcm2niix (2016); Billot et al., SynthSeg (Med Image Anal 2023); Iglesias et al., SynthSR (Sci Adv 2023); Gopinath et al., recon-all-clinical (2024).'
+      + (hippo ? ' Hipocampo: DeKraker et al., HippUnfold (eLife 2022); Poppenk et al. (TiCS 2013); Wisse et al., nota de cautela sobre subcampos em T1 1 mm (HBM 2021); Sghirripa et al., comparação de métodos (HBM 2025); Iglesias et al., segmentHA (NeuroImage 2015); Yushkevich et al., ASHS (HBM 2015); Poiret et al., HSF (Front Neuroinform 2023).' : '')
   ]
   for (const p of paras) y = pdf.paragraph(M, y, p, { size: 8.5, width: W, color: [60, 60, 60] }) + 4
   footer()

@@ -8,8 +8,9 @@ import { writeSav } from './sav.js'
 import { writeZip } from './zip.js'
 import { detectContrast, assessQuality, renderRuler } from './quality.js'
 import { buildReport } from './report.js'
+import { hasHippocampus, runHippoWorker, buildHippoOverlay, hippoNiftiGz, hippoToCSV, hippoWideColumns, hippoColor } from './hippocampus.js'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 const $ = (id) => document.getElementById(id)
 
 // ids do brainchop-parameters.js (1-indexado): [memória alta, memória baixa]
@@ -25,7 +26,7 @@ const MODELS = {
 const state = {
   nv: null, base: null, conformed: null, seg: null, labelsVol: null,
   source: null, quality: null, pipeline: 'padrao', contrast: 'desconhecido',
-  result: null, meta: null, labelNames: null, colormap: null, modelKey: null, modelEntry: null,
+  result: null, meta: null, labelNames: null, colormap: null, modelKey: null, modelEntry: null, hippo: null,
   worker: null, preWorker: null, rejectPending: null, busy: false, cancelled: false, robustLog: [], cohort: [], gpuRenderer: ''
 }
 
@@ -94,6 +95,7 @@ async function openNiftiFile(file, source = {}) {
     log(`Lendo ${file.name}…`); progress(0.2)
     const vol = await NVImage.loadFromFile({ file, name: file.name })
     state.base = vol; state.conformed = null; state.labelsVol = null; state.result = null
+    resetHippo()
     state.source = { kind: 'nifti', fileName: file.name, nFiles: 1, sidecar: {}, ...source }
     await showVolume(vol)
     if (!$('subjectId').value) $('subjectId').value = file.name.replace(/\.(nii|nii\.gz|mgz|mgh|nrrd)$/i, '').slice(0, 40)
@@ -352,7 +354,90 @@ async function finishSegmentation({ conf, labels, modelSel, backend, t0 }) {
   renderStats()
   setStep('stats', 'done'); setStep('export', 'active')
   setExportsEnabled(true)
+  // habilita a análise hipocampal quando o modelo rotula o hipocampo
+  resetHippo()
+  if (hasHippocampus(labelNames)) {
+    $('btnHippo').disabled = false
+    $('hippoBody').innerHTML = '<p class="empty">Segmentação pronta. Clique em <b>Analisar hipocampo</b> para refinar a máscara e dividir em cabeça · corpo · cauda.</p>'
+  } else {
+    $('hippoBody').innerHTML = '<p class="empty">O modelo selecionado não rotula o hipocampo. Use aseg 18 ou aparc+aseg.</p>'
+  }
   progress(0); log(`Segmentação concluída em ${state.meta.elapsedS} s — ${result.regions.length} regiões`)
+}
+
+// ---------------------------------------------------------------- hipocampo
+function resetHippo() {
+  if (state.hippo?.overlay && state.nv) {
+    try { state.nv.removeVolume(state.hippo.overlay) } catch { /* já removido junto com o volume base */ }
+  }
+  state.hippo = null
+  $('btnHippo').disabled = true
+  for (const b of document.querySelectorAll('#panelHippo [data-export]')) b.disabled = true
+  $('hippoBody').innerHTML = '<p class="empty">Após segmentar com um modelo que rotule o hipocampo (aseg / aparc+aseg), esta análise refina a máscara e a divide em <b>cabeça · corpo · cauda</b> por um sistema de coordenadas longitudinal (equação de Laplace, método do HippUnfold). Em T1 ~1 mm não há contraste para subcampos (CA1–CA4, GD, subículo) — ver README.</p>'
+}
+
+async function runHippoAnalysis() {
+  if (!state.seg || !state.conformed || state.busy) return
+  const btn = $('btnHippo')
+  btn.disabled = true
+  try {
+    log('Análise hipocampal: iniciando…'); progress(0.02)
+    const t0 = performance.now()
+    const conf = state.conformed, seg = state.seg
+    const { labelsOut, result } = await runHippoWorker({
+      labels: seg, intensity: conf.img, dims: [256, 256, 256],
+      affine: conf.hdr.affine.flat(), labelNames: state.labelNames,
+      options: { refine: $('hippoRefine').checked },
+      onProgress: (msg, frac) => { log(msg); progress(frac) }
+    })
+    if (state.conformed !== conf || state.seg !== seg) return // nova segmentação começou no meio; descarta
+    result.elapsed_s = ((performance.now() - t0) / 1000).toFixed(1)
+    // sobreposição própria (acima da segmentação de cérebro inteiro)
+    if (state.hippo?.overlay) { try { await state.nv.removeVolume(state.hippo.overlay) } catch { /* ignore */ } }
+    const overlay = buildHippoOverlay(state.conformed, labelsOut, Number($('opacity').value) || 0.85)
+    await state.nv.addVolume(overlay)
+    state.hippo = { result, labels: labelsOut, overlay }
+    renderHippoPanel()
+    for (const b of document.querySelectorAll('#panelHippo [data-export]')) b.disabled = false
+    progress(0); log(`Análise hipocampal concluída em ${result.elapsed_s} s`)
+  } catch (e) {
+    console.error(e)
+    progress(0); log('Análise hipocampal falhou: ' + e.message)
+    $('hippoBody').innerHTML = `<p class="empty">Falha: ${e.message}</p>`
+  } finally {
+    btn.disabled = false
+  }
+}
+
+function renderHippoPanel() {
+  const h = state.hippo?.result
+  if (!h) return
+  const rows = []
+  const partsPT = { head: 'cabeça', body: 'corpo', tail: 'cauda' }
+  for (const [key, label, codeBase] of [['left', 'Esquerdo', 1], ['right', 'Direito', 4]]) {
+    const s = h[key]
+    if (!s) { rows.push(`<tr><td colspan="4">${label}: não analisado</td></tr>`); continue }
+    rows.push(`<tr class="hip-total" data-cent="${s.centroid_ras_mm.join(',')}"><td><b>${label} — total</b></td><td class="num">${fmt(s.volume_mm3)}</td><td class="num">${fmt(s.axis_length_mm, 1)}</td><td class="num">${fmt(s.eq_diameter_mm, 1)}</td></tr>`)
+    for (const [p, code] of [['head', codeBase], ['body', codeBase + 1], ['tail', codeBase + 2]]) {
+      const P = s[p]
+      rows.push(`<tr data-cent="${(P.centroid_ras_mm || []).join(',')}"><td><span class="sw" style="background:rgb(${hippoColor(code).join(',')})"></span>${partsPT[p]}</td><td class="num">${fmt(P.volume_mm3)}</td><td class="num">${fmt(P.length_mm, 1)}</td><td class="num">${fmt(P.eq_diameter_mm, 1)}</td></tr>`)
+    }
+  }
+  let html = `<div class="tbl-wrap"><table class="regions"><thead><tr><th>Subregião</th><th class="num">mm³</th><th class="num">compr. mm</th><th class="num">⌀ eq. mm</th></tr></thead><tbody id="hippoRows">${rows.join('')}</tbody></table></div>`
+  if (h.asymmetry?.total_pct != null) {
+    const ai = h.asymmetry
+    const f = (v) => (v == null ? '—' : (Math.abs(v) > 10 ? `<b style="color:#cd3e4e">${fmt(v, 1)}</b>` : fmt(v, 1)))
+    html += `<p class="hint" style="margin:6px 0 0">Assimetria 2(E−D)/(E+D)×100: total ${f(ai.total_pct)} % · cabeça ${f(ai.head_pct)} · corpo ${f(ai.body_pct)} · cauda ${f(ai.tail_pct)}</p>`
+  }
+  const flags = [...(h.left?.qc_flags || []).map((x) => 'E: ' + x), ...(h.right?.qc_flags || []).map((x) => 'D: ' + x)]
+  if (flags.length) html += `<ul class="reasons" style="margin-top:6px">${flags.map((x) => `<li>⚠ ${x}</li>`).join('')}</ul>`
+  html += `<p class="hint" style="margin:6px 0 0">Subregiões pelo eixo longitudinal (Laplace + fração do comprimento de arco: cabeça &lt; ${Math.round(h.options.headFrac * 100)} %, cauda &gt; ${Math.round(h.options.tailFrac * 100)} %)${h.options.refine ? ', máscara refinada por intensidade' : ''}. Não são subcampos histológicos. Clique numa linha para centrar a mira.</p>`
+  $('hippoBody').innerHTML = html
+  $('hippoRows').onclick = (e) => {
+    const tr = e.target.closest('tr'); if (!tr?.dataset.cent) return
+    const c = tr.dataset.cent.split(',').map(Number)
+    if (c.length === 3 && c.every(Number.isFinite)) { state.nv.scene.crosshairPos = state.nv.mm2frac(c); state.nv.drawScene() }
+  }
 }
 
 function setBusy(on) {
@@ -460,7 +545,12 @@ function renderStats() {
 // ---------------------------------------------------------------- exportações
 function exportJSONObject() {
   return { app: state.meta.app, meta: state.meta, quality: state.quality, model: { key: state.modelKey, label: state.meta.modelLabel, path: state.modelEntry.path },
-    summaries: state.result.summaries, lobes: state.result.lobes, hemispheres: state.result.hemispheres, asymmetry: state.result.asymmetry, regions: state.result.regions }
+    summaries: state.result.summaries, lobes: state.result.lobes, hemispheres: state.result.hemispheres, asymmetry: state.result.asymmetry,
+    hippocampus: state.hippo?.result || null, regions: state.result.regions }
+}
+/** linha larga do sujeito, incluindo colunas hipocampais quando a análise foi executada */
+function wideRow() {
+  return { ...toWideRow(state.result, state.meta), ...hippoWideColumns(state.hippo?.result) }
 }
 function snapshot() {
   const nv = state.nv
@@ -501,13 +591,15 @@ async function doExport(kind) {
     switch (kind) {
       case 'csv': download(new Blob([toCSV(state.result, state.meta)], { type: 'text/csv' }), `${base}_regioes.csv`); break
       case 'json': download(new Blob([JSON.stringify(exportJSONObject(), null, 2)], { type: 'application/json' }), `${base}.json`); break
-      case 'sav': download(new Blob([wideToSav([toWideRow(state.result, state.meta)])]), `${base}.sav`); break
+      case 'sav': download(new Blob([wideToSav([wideRow()])]), `${base}.sav`); break
       case 'pdf': {
         log('Gerando PDF…')
-        const bytes = buildReport({ meta: state.meta, quality: state.quality, result: state.result, snapshot: snapshot(), modelInfo: { key: state.modelKey, label: state.meta.modelLabel } })
+        const bytes = buildReport({ meta: state.meta, quality: state.quality, result: state.result, snapshot: snapshot(), modelInfo: { key: state.modelKey, label: state.meta.modelLabel }, hippo: state.hippo?.result })
         download(new Blob([bytes], { type: 'application/pdf' }), `${base}_relatorio.pdf`); break
       }
       case 'seg': download(await segNiftiGz(), `${base}_seg.nii.gz`); break
+      case 'hippo-csv': if (state.hippo) download(new Blob([hippoToCSV(state.hippo.result, state.meta)], { type: 'text/csv' }), `${base}_hipocampo.csv`); break
+      case 'hippo-nii': if (state.hippo) download(await hippoNiftiGz(state.conformed, state.hippo.labels), `${base}_hipocampo.nii.gz`); break
       case 'conf': download(await confNiftiGz(), `${base}_conformado.nii.gz`); break
       case 'src': if (state.source?.convertedFile) download(state.source.convertedFile, state.source.convertedFile.name); break
       case 'zip': {
@@ -515,11 +607,15 @@ async function doExport(kind) {
         const entries = [
           { name: `${base}_regioes.csv`, data: new TextEncoder().encode(toCSV(state.result, state.meta)) },
           { name: `${base}.json`, data: new TextEncoder().encode(JSON.stringify(exportJSONObject(), null, 2)) },
-          { name: `${base}.sav`, data: wideToSav([toWideRow(state.result, state.meta)]) },
-          { name: `${base}_relatorio.pdf`, data: buildReport({ meta: state.meta, quality: state.quality, result: state.result, snapshot: snapshot(), modelInfo: { key: state.modelKey, label: state.meta.modelLabel } }) },
+          { name: `${base}.sav`, data: wideToSav([wideRow()]) },
+          { name: `${base}_relatorio.pdf`, data: buildReport({ meta: state.meta, quality: state.quality, result: state.result, snapshot: snapshot(), modelInfo: { key: state.modelKey, label: state.meta.modelLabel }, hippo: state.hippo?.result }) },
           { name: `${base}_seg.nii.gz`, data: new Uint8Array(await (await segNiftiGz()).arrayBuffer()) },
           { name: `${base}_conformado.nii.gz`, data: new Uint8Array(await (await confNiftiGz()).arrayBuffer()) }
         ]
+        if (state.hippo) {
+          entries.push({ name: `${base}_hipocampo.csv`, data: new TextEncoder().encode(hippoToCSV(state.hippo.result, state.meta)) })
+          entries.push({ name: `${base}_hipocampo.nii.gz`, data: new Uint8Array(await (await hippoNiftiGz(state.conformed, state.hippo.labels)).arrayBuffer()) })
+        }
         if (state.source?.convertedFile) entries.push({ name: state.source.convertedFile.name, data: new Uint8Array(await state.source.convertedFile.arrayBuffer()) })
         if (state.source?.sidecarFile) entries.push({ name: state.source.sidecarFile.name, data: new Uint8Array(await state.source.sidecarFile.arrayBuffer()) })
         download(new Blob([writeZip(entries)], { type: 'application/zip' }), `${base}.zip`); break
@@ -545,7 +641,7 @@ function renderCohort() {
 }
 function addToCohort() {
   if (!state.result) return
-  const row = toWideRow(state.result, state.meta)
+  const row = wideRow()
   const idx = state.cohort.findIndex((c) => c.row.subject_id === row.subject_id && c.row.session === row.session && c.row.model === row.model)
   if (idx >= 0) state.cohort[idx] = { row }; else state.cohort.push({ row })
   saveCohort(); renderCohort()
@@ -585,8 +681,14 @@ function bind() {
   $('inNifti').onchange = (e) => { if (e.target.files[0]) openNiftiFile(e.target.files[0]); e.target.value = '' }
   $('btnDemo').onclick = loadDemo
   $('btnRun').onclick = runSegmentation
+  $('btnHippo').onclick = runHippoAnalysis
   $('modelSel').onchange = () => { $('customModelField').hidden = $('modelSel').value !== 'custom' }
-  $('opacity').oninput = (e) => { if (state.labelsVol) { state.nv.setOpacity(state.nv.volumes.length - 1, Number(e.target.value)); state.nv.updateGLVolume() } }
+  $('opacity').oninput = (e) => {
+    const op = Number(e.target.value)
+    let changed = false
+    state.nv.volumes.forEach((v, i) => { if (v === state.labelsVol || v === state.hippo?.overlay) { state.nv.setOpacity(i, op); changed = true } })
+    if (changed) state.nv.updateGLVolume()
+  }
   $('layoutSel').onchange = (e) => {
     const nv = state.nv, v = e.target.value
     nv.setSliceType({ mpr: nv.sliceTypeMultiplanar, axial: nv.sliceTypeAxial, coronal: nv.sliceTypeCoronal, sagittal: nv.sliceTypeSagittal, render: nv.sliceTypeRender }[v])
@@ -626,7 +728,7 @@ function bind() {
     loadCohort()
     window.morfo = { openDicomFiles, openNiftiFile, state } // acesso programático / testes
     // API para scripts/console: window.morfo.state, openNiftiFile(File), runSegmentation(), finishSegmentation({conf, labels, modelSel, backend, t0}), doExport(kind)
-    window.morfo = { state, openNiftiFile, openDicomFiles, runSegmentation, cancelSegmentation, finishSegmentation, currentModelEntry, doExport, addToCohort, computeStats, VERSION }
+    window.morfo = { state, openNiftiFile, openDicomFiles, runSegmentation, cancelSegmentation, finishSegmentation, currentModelEntry, doExport, addToCohort, computeStats, runHippoAnalysis, VERSION }
     log('pronto — abra uma pasta DICOM ou um NIfTI')
   } catch (e) {
     console.error(e)
