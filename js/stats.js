@@ -44,15 +44,16 @@ export function parseName(name) {
   else if (/^ctx-lh-/.test(name)) { hemi = 'L'; base = name.replace(/^ctx-lh-/, '') }
   else if (/^ctx-rh-/.test(name)) { hemi = 'R'; base = name.replace(/^ctx-rh-/, '') }
   else if (/^ctx-/.test(name)) { base = name.replace(/^ctx-/, '') }
-  const cortical = /^ctx-/.test(name) || name === 'Cerebral-Cortex'
+  const cortical = /^ctx-/.test(name) || base === 'Cerebral-Cortex'
   return { hemi, base, cortical }
 }
 
 export function namePT(name) {
-  const { hemi, base, cortical } = parseName(name)
+  const { hemi, base } = parseName(name)
   const pt = PT[base] || base
-  const side = hemi === 'L' ? ' esquerdo' : hemi === 'R' ? ' direito' : ''
-  return cortical && PT[base] ? `Córtex ${pt.charAt(0).toLowerCase() + pt.slice(1)}${side}` : `${pt}${side}`
+  const fem = /^(Amygdala|Cerebral-White-Matter|Cerebellum-White-Matter|WM|GM|White Matter|Grey Matter)$/.test(base)
+  const side = hemi === 'L' ? (fem ? ' esquerda' : ' esquerdo') : hemi === 'R' ? (fem ? ' direita' : ' direito') : ''
+  return /^ctx-/.test(name) && PT[base] ? `Córtex ${pt.charAt(0).toLowerCase() + pt.slice(1)}${side}` : `${pt}${side}`
 }
 
 /**
@@ -79,10 +80,26 @@ export function computeStats({ labels, intensity, dims, affine, voxelVolume, lab
       for (let i = 0; i < nx; i++, idx++) {
         const l = labels[idx]
         if (l === 0) continue
-        const v = intensity[idx]
+        const v = intensity ? intensity[idx] : 0
         count[l]++; sum[l] += v; sumsq[l] += v * v
         sx[l] += i; sy[l] += j; sz[l] += k
-        if (a[0] * i + xBase < 0) leftN[l]++; else rightN[l]++
+      }
+    }
+  }
+  // linha média estimada: x RAS do centroide de todos os voxels rotulados (x=0 do arquivo é o centro
+  // do FOV/scanner, não a linha média do cérebro). 2ª passada conta E/D em relação a ela.
+  let tn = 0, ti = 0, tj = 0, tk = 0
+  for (let l = 1; l < NL; l++) { tn += count[l]; ti += sx[l]; tj += sy[l]; tk += sz[l] }
+  const midX = tn ? a[0] * ti / tn + a[1] * tj / tn + a[2] * tk / tn + a[3] : 0
+  idx = 0
+  for (let k = 0; k < nz; k++) {
+    for (let j = 0; j < ny; j++) {
+      const xBase = a[1] * j + a[2] * k + a[3] - midX
+      for (let i = 0; i < nx; i++, idx++) {
+        const l = labels[idx]
+        if (l === 0) continue
+        const x = a[0] * i + xBase
+        if (x < 0) leftN[l]++; else if (x > 0) rightN[l]++; else { leftN[l] += 0.5; rightN[l] += 0.5 }
       }
     }
   }
@@ -91,8 +108,9 @@ export function computeStats({ labels, intensity, dims, affine, voxelVolume, lab
     const name = labelNames[String(l)]
     if (!name || count[l] === 0) continue
     const n = count[l]
-    const mean = sum[l] / n
-    const variance = Math.max(0, sumsq[l] / n - mean * mean)
+    // sem imagem de intensidade alinhada (segmentação importada na grade nativa): média/DP ausentes
+    const mean = intensity ? sum[l] / n : null
+    const variance = intensity ? Math.max(0, sumsq[l] / n - mean * mean) : null
     const ci = sx[l] / n, cj = sy[l] / n, ck = sz[l] / n
     const cx = a[0] * ci + a[1] * cj + a[2] * ck + a[3]
     const cy = a[4] * ci + a[5] * cj + a[6] * ck + a[7]
@@ -102,7 +120,7 @@ export function computeStats({ labels, intensity, dims, affine, voxelVolume, lab
       id: l, name, namePT: namePT(name), hemi, base, cortical,
       rgb: colormap ? [colormap.R[l], colormap.G[l], colormap.B[l]] : [128, 128, 128],
       voxels: n, volume_mm3: n * voxelVolume,
-      mean_intensity: mean, sd_intensity: Math.sqrt(variance),
+      mean_intensity: mean, sd_intensity: variance == null ? null : Math.sqrt(variance),
       centroid_ras_mm: [cx, cy, cz],
       left_mm3: leftN[l] * voxelVolume, right_mm3: rightN[l] * voxelVolume
     })
@@ -119,22 +137,25 @@ export function computeStats({ labels, intensity, dims, affine, voxelVolume, lab
   const isBrainstem = (r) => /^Brain-Stem$/.test(r.base)
   const isSubGM = (r) => /^(Thalamus|Thalamus-Proper\*?|Caudate|Putamen|Pallidum|Hippocampus|Amygdala|Accumbens-area|VentralDC)$/.test(r.base)
   const isCC = (r) => /^CC_|^Corpus callosum$/.test(r.base)
+  const modelParts = Object.entries(labelNames).filter(([k, n]) => Number(k) > 0 && n).map(([, n]) => parseName(n))
+  const has = (pred) => modelParts.some(pred)
+  const sumOrNull = (pred) => (has(pred) ? sumOf(pred) : null)
   const totalSeg = sumOf(() => true)
   const parenchyma = sumOf((r) => !isVentricle(r) && !isCSF(r))
   const summaries = {
     total_segmented_mm3: totalSeg,
     brain_parenchyma_mm3: parenchyma,
-    cortical_gm_mm3: sumOf(isCortex),
-    cerebral_wm_mm3: sumOf(isCerebralWM),
-    subcortical_gm_mm3: sumOf(isSubGM),
-    cerebellum_cortex_mm3: sumOf(isCbCortex),
-    cerebellum_wm_mm3: sumOf(isCbWM),
-    cerebellum_total_mm3: sumOf((r) => isCbCortex(r) || isCbWM(r)),
-    brainstem_mm3: sumOf(isBrainstem),
-    ventricles_mm3: sumOf(isVentricle),
-    csf_extraventricular_mm3: sumOf(isCSF),
-    corpus_callosum_mm3: sumOf(isCC),
-    ventricle_brain_ratio_pct: parenchyma > 0 ? (100 * sumOf(isVentricle)) / (parenchyma + sumOf(isVentricle)) : null
+    cortical_gm_mm3: sumOrNull(isCortex),
+    cerebral_wm_mm3: sumOrNull(isCerebralWM),
+    subcortical_gm_mm3: sumOrNull(isSubGM),
+    cerebellum_cortex_mm3: sumOrNull(isCbCortex),
+    cerebellum_wm_mm3: sumOrNull(isCbWM),
+    cerebellum_total_mm3: sumOrNull((r) => isCbCortex(r) || isCbWM(r)),
+    brainstem_mm3: sumOrNull(isBrainstem),
+    ventricles_mm3: sumOrNull(isVentricle),
+    csf_extraventricular_mm3: sumOrNull(isCSF),
+    corpus_callosum_mm3: sumOrNull(isCC),
+    ventricle_brain_ratio_pct: has(isVentricle) && parenchyma > 0 ? (100 * sumOf(isVentricle)) / (parenchyma + sumOf(isVentricle)) : null
   }
   // lobos (só quando há parcelação cortical)
   const lobes = {}
@@ -149,7 +170,7 @@ export function computeStats({ labels, intensity, dims, affine, voxelVolume, lab
   // hemisférios: por rótulo (quando há L/R) ou por linha média
   const labeledLR = regions.some((r) => r.hemi)
   const hemispheres = {
-    method: labeledLR ? 'rótulos L/R do modelo' : 'divisão pela linha média (x = 0 em RAS), aproximada',
+    method: labeledLR ? 'rótulos L/R do modelo' : `divisão pela linha média estimada (x RAS = ${midX.toFixed(1)} mm, centroide do encéfalo), aproximada`,
     left_parenchyma_mm3: labeledLR
       ? sumOf((r) => r.hemi === 'L' && !isVentricle(r))
       : regions.filter((r) => !isVentricle(r) && !isCSF(r)).reduce((s, r) => s + r.left_mm3, 0),
@@ -164,7 +185,7 @@ export function computeStats({ labels, intensity, dims, affine, voxelVolume, lab
     const byBase = {}
     for (const r of regions) if (r.hemi) (byBase[r.base] ||= {})[r.hemi] = r
     for (const [base, lr] of Object.entries(byBase)) {
-      if (lr.L && lr.R) asymmetry.push({ base, name_pt: namePT(lr.L.name).replace(/ esquerdo$/, ''), left_mm3: lr.L.volume_mm3, right_mm3: lr.R.volume_mm3, ai_pct: ai(lr.L.volume_mm3, lr.R.volume_mm3), method: 'rótulos' })
+      if (lr.L && lr.R) asymmetry.push({ base, name_pt: namePT(lr.L.name).replace(/ esquerd[oa]$/, ''), left_mm3: lr.L.volume_mm3, right_mm3: lr.R.volume_mm3, ai_pct: ai(lr.L.volume_mm3, lr.R.volume_mm3), method: 'rótulos' })
     }
   } else {
     for (const r of regions) {
@@ -173,7 +194,9 @@ export function computeStats({ labels, intensity, dims, affine, voxelVolume, lab
     }
   }
   for (const r of regions) r.pct_parenchyma = parenchyma > 0 ? (100 * r.volume_mm3) / parenchyma : null
-  return { regions, summaries, lobes, hemispheres, asymmetry }
+  const present = new Set(regions.map((r) => r.name))
+  const absentLabels = Object.entries(labelNames).filter(([k, n]) => Number(k) > 0 && n && !present.has(n)).map(([, n]) => n)
+  return { regions, summaries, lobes, hemispheres, asymmetry, absentLabels, midlineX_mm: labeledLR ? null : midX }
 }
 
 /** tabela longa (uma linha por região) */
@@ -184,8 +207,9 @@ export function toCSV(result, meta) {
   for (const r of result.regions) {
     rows.push([meta.subjectId, meta.session, meta.modelKey, meta.qualityTier, meta.pipeline, r.id, r.name, r.namePT, r.hemi || '', r.voxels, r.volume_mm3, r.pct_parenchyma, r.mean_intensity, r.sd_intensity, ...r.centroid_ras_mm, r.left_mm3, r.right_mm3].map(esc).join(','))
   }
-  for (const [k, v] of Object.entries(result.summaries)) rows.push([meta.subjectId, meta.session, meta.modelKey, meta.qualityTier, meta.pipeline, '', k, 'resumo', '', '', v].map(esc).join(','))
-  for (const [k, v] of Object.entries(result.lobes)) rows.push([meta.subjectId, meta.session, meta.modelKey, meta.qualityTier, meta.pipeline, '', 'lobe_' + k, v.name_pt, '', '', v.total_mm3].map(esc).join(','))
+  const pad = (arr) => { while (arr.length < head.length) arr.push(''); return arr }
+  for (const [k, v] of Object.entries(result.summaries)) rows.push(pad([meta.subjectId, meta.session, meta.modelKey, meta.qualityTier, meta.pipeline, '', k, 'resumo', '', '', v]).map(esc).join(','))
+  for (const [k, v] of Object.entries(result.lobes)) rows.push(pad([meta.subjectId, meta.session, meta.modelKey, meta.qualityTier, meta.pipeline, '', 'lobe_' + k, v.name_pt, '', '', v.total_mm3]).map(esc).join(','))
   return '\ufeff' + rows.join('\r\n')
 }
 
@@ -201,6 +225,7 @@ export function toWideRow(result, meta) {
   row.right_parenchyma_mm3 = result.hemispheres.right_parenchyma_mm3
   for (const [k, v] of Object.entries(result.lobes)) { row[`lobe_${k}_mm3`] = v.total_mm3; if (v.left_mm3 != null) { row[`lobe_${k}_L_mm3`] = v.left_mm3; row[`lobe_${k}_R_mm3`] = v.right_mm3 } }
   for (const r of result.regions) row[`${r.name}_mm3`] = r.volume_mm3
+  for (const name of result.absentLabels || []) row[`${name}_mm3`] = 0
   for (const a of result.asymmetry) row[`AI_${a.base}_pct`] = a.ai_pct
   return row
 }

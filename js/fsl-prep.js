@@ -135,29 +135,39 @@ export function cropNeck({ img, dims, pixdims, affine, keepMM = 170, minAreaMM2 
 }
 
 // ---------------------------------------------------------------- morfologia p/ limpeza de máscara (≈ pós-BET)
+// dilatação/erosão 6-viz guiadas pelos voxels da máscara com deslocamentos de índice (sem arrays de
+// vizinhos por voxel): ~20× mais rápidas que a versão ingênua em 256³ (1,8–2,7 s → ~0,1–0,2 s)
 export function dilate6(mask, dims) {
   const [nx, ny, nz] = dims
+  const nxy = nx * ny
   const out = Uint8Array.from(mask)
-  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
-    const i = x + y * nx + z * nx * ny
-    if (mask[i]) continue
-    for (const [dx, dy, dz] of NB6) {
-      const X = x + dx, Y = y + dy, Z = z + dz
-      if (X < 0 || Y < 0 || Z < 0 || X >= nx || Y >= ny || Z >= nz) continue
-      if (mask[X + Y * nx + Z * nx * ny]) { out[i] = 1; break }
+  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) {
+    const row = y * nx + z * nxy
+    for (let x = 0; x < nx; x++) {
+      const i = row + x
+      if (!mask[i]) continue
+      if (x > 0) out[i - 1] = 1
+      if (x < nx - 1) out[i + 1] = 1
+      if (y > 0) out[i - nx] = 1
+      if (y < ny - 1) out[i + nx] = 1
+      if (z > 0) out[i - nxy] = 1
+      if (z < nz - 1) out[i + nxy] = 1
     }
   }
   return out
 }
 export function erode6(mask, dims) {
   const [nx, ny, nz] = dims
+  const nxy = nx * ny
   const out = Uint8Array.from(mask)
-  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
-    const i = x + y * nx + z * nx * ny
-    if (!mask[i]) continue
-    for (const [dx, dy, dz] of NB6) {
-      const X = x + dx, Y = y + dy, Z = z + dz
-      if (X < 0 || Y < 0 || Z < 0 || X >= nx || Y >= ny || Z >= nz || !mask[X + Y * nx + Z * nx * ny]) { out[i] = 0; break }
+  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) {
+    const row = y * nx + z * nxy
+    for (let x = 0; x < nx; x++) {
+      const i = row + x
+      if (!mask[i]) continue
+      // borda do volume conta como fora (mesma semântica da versão anterior)
+      if (x === 0 || x === nx - 1 || y === 0 || y === ny - 1 || z === 0 || z === nz - 1 ||
+          !mask[i - 1] || !mask[i + 1] || !mask[i - nx] || !mask[i + nx] || !mask[i - nxy] || !mask[i + nxy]) out[i] = 0
     }
   }
   return out

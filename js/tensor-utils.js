@@ -40,36 +40,14 @@ export async function binarizeVolumeDataTensor(volumeDataTensor) {
 }
 
 async function calculateQuantiles(tensor, lowerQuantile = 0.01, upperQuantile = 0.99) {
-  // Flatten the tensor
-  const flatTensor = tensor.flatten()
-
-  // Convert the flattened tensor to an array to sort it
-  const flatArray = await flatTensor.array()
-  flatArray.sort((a, b) => a - b) // Sort the array in ascending order
-
-  // Convert the sorted array back to a tensor
-  const sortedTensor = tf.tensor1d(flatArray)
-
-  // Calculate the indices for the quantiles
-  const numElements = sortedTensor.shape[0]
+  // Morfo Studio: mesmas estatísticas de ordem, com ordenação de array tipado (numérica, sem comparador).
+  // O original convertia 16,7 M voxels num Array JS e ordenava com (a, b) => a − b: ~8 s e ~200 MB.
+  const data = await tensor.data()
+  const sorted = Float32Array.from(data).sort()
+  const numElements = sorted.length
   const lowIndex = Math.floor(numElements * lowerQuantile)
-  const highIndex = Math.ceil(numElements * upperQuantile) - 1 // Subtract 1 because indices are 0-based
-
-  // Slice the sorted tensor to get qmin and qmax
-  const qmin = sortedTensor.slice(lowIndex, 1) // Get the value at the low index
-  const qmax = sortedTensor.slice(highIndex, 1) // Get the value at the high index
-
-  // Get the actual values from the tensors
-  const qminValue = (await qmin.array())[0]
-  const qmaxValue = (await qmax.array())[0]
-
-  // Clean up tensors to free memory
-  flatTensor.dispose()
-  sortedTensor.dispose()
-  qmin.dispose()
-  qmax.dispose()
-
-  return { qmin: qminValue, qmax: qmaxValue }
+  const highIndex = Math.ceil(numElements * upperQuantile) - 1 // índices base 0
+  return { qmin: sorted[lowIndex], qmax: sorted[highIndex] }
 }
 
 export async function convByOutputChannelAndInputSlicing(input, filter, biases, stride, pad, dilationRate, sliceSize) {
@@ -290,7 +268,8 @@ export async function generateOutputSlicesV2(
       return maskedData
     }
   }
-  return img
+  // Morfo Studio: rótulos cabem em uint8 (≤ 255); o Uint32Array original tinha 64 MB e era copiado no postMessage
+  return allOutputSlices3DCC1DimArray
 }
 
 export async function getAllSlicesDataAsTF3D(num_of_slices, niftiHeader, niftiImage) {

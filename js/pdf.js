@@ -81,17 +81,18 @@ export class MiniPDF {
     return tw
   }
   // texto com quebra de linha automática; retorna y final
-  paragraph(x, y, str, { size = 10, bold = false, color = [20, 20, 20], width = 400, lineHeight = 1.35 } = {}) {
+  paragraph(x, y, str, { size = 10, bold = false, color = [20, 20, 20], width = 400, lineHeight = 1.35, beforeLine = null } = {}) {
     const words = String(str).split(/\s+/)
     let line = ''
     const lh = size * lineHeight
     for (const w of words) {
       const test = line ? line + ' ' + w : w
       if (textWidth(test, size, bold) > width && line) {
+        if (beforeLine) y = beforeLine(y, lh)
         this.text(x, y, line, { size, bold, color }); y += lh; line = w
       } else line = test
     }
-    if (line) { this.text(x, y, line, { size, bold, color }); y += lh }
+    if (line) { if (beforeLine) y = beforeLine(y, lh); this.text(x, y, line, { size, bold, color }); y += lh }
     return y
   }
   rect(x, y, w, h, fill = [230, 230, 230], stroke = null) {

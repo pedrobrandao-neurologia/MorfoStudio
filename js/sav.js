@@ -30,7 +30,10 @@ function makeShortNames(longNames) {
 
 function padBytes(bytes, len, fill = 0x20) {
   const out = new Uint8Array(len).fill(fill)
-  out.set(bytes.subarray(0, len))
+  // corta em fronteira de caractere UTF-8 (não no meio de um byte de continuação 10xxxxxx)
+  let n = Math.min(len, bytes.length)
+  if (n < bytes.length) while (n > 0 && (bytes[n] & 0xC0) === 0x80) n--
+  out.set(bytes.subarray(0, n))
   return out
 }
 
@@ -57,7 +60,14 @@ class ByteWriter {
  * @returns {Uint8Array}
  */
 export function writeSav({ variables, rows, fileLabel = 'Morfo Studio' }) {
-  const longNames = variables.map((v) => sanitizeLong(v.name))
+  const seenLong = new Set()
+  const longNames = variables.map((v) => {
+    const base = sanitizeLong(v.name)
+    let n = base, k = 2
+    while (seenLong.has(n.toUpperCase())) { const suf = '_' + k++; n = base.slice(0, 64 - suf.length) + suf }
+    seenLong.add(n.toUpperCase())
+    return n
+  })
   const shortNames = makeShortNames(longNames)
   const vars = variables.map((v, i) => {
     const isStr = v.type === 'string'

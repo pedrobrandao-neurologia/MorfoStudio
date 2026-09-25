@@ -21,7 +21,17 @@ import {
   SequentialConvLayer
 } from './tensor-utils.js'
 
+// Morfo Studio: protocolo de falha explícito. O código original às vezes só posta um "modal" e retorna
+// sem imagem (o app ficaria esperando para sempre) e às vezes posta avisos inofensivos como modal
+// (ex.: tf.memory().unreliable, sempre verdadeiro no backend CPU). Aqui: modais viram avisos; se a
+// inferência termina sem imagem, posta {cmd:'fatal'} com o último modal como motivo.
+let imgSent = false
+let lastModal = ''
+// endScope sem escopo ativo lança "reading 'track'" e esconde o erro original
+function safeEndScope() { if (tf.engine().state.activeScope) tf.engine().endScope() }
 function callbackUI(message = '', progressFrac = -1, modalMessage = '', statData = []) {
+  // guarda o PRIMEIRO erro real (erros em cascata posteriores mascaravam a causa); avisos não contam
+  if (modalMessage && !lastModal && !/^unreliable reasons|^expected \d+ labels|not dead code/.test(modalMessage)) lastModal = modalMessage
   let statStr = []
   if (Object.keys(statData).length > 0) {
     function arrayToStr() {
@@ -43,7 +53,11 @@ function callbackUI(message = '', progressFrac = -1, modalMessage = '', statData
 }
 
 function callbackImg(img, opts, modelEntry) {
-  self.postMessage({ cmd: 'img', img, opts, modelEntry })
+  imgSent = true
+  // transfere o buffer (sem cópia estruturada de 16–64 MB) só para as saídas uint8 recém-alocadas de
+  // generateOutputSlicesV2; generateBrainMask ainda usa o Int32Array depois (tf.tensor(brainOut)), então é copiado
+  const transfer = img instanceof Uint8Array && img.byteOffset === 0 && img.byteLength === img.buffer.byteLength ? [img.buffer] : []
+  self.postMessage({ cmd: 'img', img, opts, modelEntry }, transfer)
 }
 
 async function inferenceFullVolumeSeqCovLayerPhase2(
@@ -149,7 +163,7 @@ async function inferenceFullVolumeSeqCovLayerPhase2(
     const layersLength = res.layers.length
     console.log('res.layers.length ', layersLength)
 
-    const isChannelLast = isModelChnlLast(res)
+    const isChannelLast = await isModelChnlLast(res)
     const batchSize = opts.batchSize
     const numOfChan = opts.numOfChan
     let adjusted_input_shape
@@ -225,7 +239,7 @@ async function inferenceFullVolumeSeqCovLayerPhase2(
         const errTxt = 'Your graphics card (e.g. Intel) may not be compatible with WebGL. ' + err.message
         callbackUI(errTxt, -1, errTxt)
 
-        tf.engine().endScope()
+        safeEndScope()
         tf.engine().disposeVariables()
 
         statData.Inference_t = Infinity
@@ -248,7 +262,7 @@ async function inferenceFullVolumeSeqCovLayerPhase2(
       callbackUI('Layer ' + i.toString(), (i + 1) / layersLength)
       if (tf.memory().unreliable) {
         const unreliableReasons = 'unreliable reasons :' + tf.memory().reasons
-        callbackUI(unreliableReasons, NaN, unreliableReasons)
+        callbackUI(unreliableReasons, NaN)
       }
       if (i === layersLength - 2) {
         // Stop before the last layer or classification layer.
@@ -261,12 +275,8 @@ async function inferenceFullVolumeSeqCovLayerPhase2(
         const seqConvLayer = await new SequentialConvLayer(res, 10, isChannelLast, callbackUI)
 
         // Apply the last output tensor to the seq. instance
-        let outputTensor = null
-        const profileInfo = await tf.profile(async () => {
-          // Your tensor operations here
-          outputTensor = await seqConvLayer.apply(curTensor[i])
-        })
-        console.log('profileInfo : ', profileInfo)
+        // sem tf.profile: sem EXT_disjoint_timer_query o profiler faz dataSync em cada kernel
+        const outputTensor = await seqConvLayer.apply(curTensor[i])
 
         // -- document.getElementById("progressBarChild").style.width = 0 + "%";
 
@@ -291,6 +301,13 @@ async function inferenceFullVolumeSeqCovLayerPhase2(
         const curBatchMaxLabel = await outputTensor.max().dataSync()[0]
         if (maxLabelPredicted < curBatchMaxLabel) {
           maxLabelPredicted = curBatchMaxLabel
+        }
+
+        if (!modelEntry.isScalar && maxLabelPredicted === 0) {
+          const t = 'A rede devolveu apenas fundo — provável falta de memória/contexto WebGL perdido'
+          callbackUI(t, -1, t)
+          safeEndScope()
+          return 0
         }
 
         const numSegClasses = maxLabelPredicted + 1
@@ -364,11 +381,11 @@ async function inferenceFullVolumeSeqCovLayerPhase2(
           console.log(' Phase-2 num of tensors after generateOutputSlicesV2: ', tf.memory().numTensors)
 
           tf.dispose(outLabelVolume)
-          tf.engine().endScope()
+          safeEndScope()
           tf.engine().disposeVariables()
         } catch (error) {
           // -- Timing data to collect
-          tf.engine().endScope()
+          safeEndScope()
           tf.engine().disposeVariables()
           console.log('Error while generating output: ', error)
           const msg = 'Failed while generating output due to limited browser memory available'
@@ -412,7 +429,7 @@ async function inferenceFullVolumeSeqCovLayerPhase2(
     )
     if (tf.memory().unreliable) {
       const unreliableReasons = 'unreliable reasons :' + tf.memory().reasons
-      callbackUI(unreliableReasons, NaN, unreliableReasons)
+      callbackUI(unreliableReasons, NaN)
     }
   }
 }
@@ -531,7 +548,7 @@ async function inferenceFullVolumePhase2(
     const layersLength = res.layers.length
     console.log('res.layers.length ', layersLength)
 
-    const isChannelLast = isModelChnlLast(res)
+    const isChannelLast = await isModelChnlLast(res)
     const batchSize = opts.batchSize
     const numOfChan = opts.numOfChan
 
@@ -583,7 +600,7 @@ async function inferenceFullVolumePhase2(
         curTensor[i] = res.layers[i].apply(curTensor[i - 1])
       } catch (err) {
         callbackUI(err.message, -1, err.message)
-        tf.engine().endScope()
+        safeEndScope()
         tf.engine().disposeVariables()
 
         statData.Inference_t = Infinity
@@ -603,7 +620,7 @@ async function inferenceFullVolumePhase2(
       curTensor[i - 1].dispose()
       if (tf.memory().unreliable) {
         const unreliableReasons = 'unreliable reasons :' + tf.memory().reasons
-        callbackUI(unreliableReasons, NaN, unreliableReasons)
+        callbackUI(unreliableReasons, NaN)
       }
 
       if (i === layersLength - 1) {
@@ -659,7 +676,7 @@ async function inferenceFullVolumePhase2(
               const errTxt = "argMax buffer couldn't be created due to limited memory resources."
               callbackUI(errTxt, -1, errTxt)
 
-              tf.engine().endScope()
+              safeEndScope()
               tf.engine().disposeVariables()
 
               statData.Inference_t = Infinity
@@ -676,9 +693,9 @@ async function inferenceFullVolumePhase2(
             const errTxt = "argMax buffer couldn't be created due to limited memory resources."
             callbackUI(errTxt, -1, errTxt)
 
-            prediction_argmax.dispose()
+            prediction_argmax?.dispose()
 
-            tf.engine().endScope()
+            safeEndScope()
             tf.engine().disposeVariables()
 
             statData.Inference_t = Infinity
@@ -705,6 +722,13 @@ async function inferenceFullVolumePhase2(
 
         if (maxLabelPredicted < curBatchMaxLabel) {
           maxLabelPredicted = curBatchMaxLabel
+        }
+
+        if (!modelEntry.isScalar && maxLabelPredicted === 0) {
+          const t = 'A rede devolveu apenas fundo — provável falta de memória/contexto WebGL perdido'
+          callbackUI(t, -1, t)
+          safeEndScope()
+          return 0
         }
 
         const numSegClasses = maxLabelPredicted + 1
@@ -757,7 +781,7 @@ async function inferenceFullVolumePhase2(
         // To clean the skull area wrongly segmented in phase-2.
         if (!isScalar) {
           if (pipeline1_out != null && opts.isBrainCropMaskBased && filterOutWithPreMask) {
-            const bin = binarizeVolumeDataTensor(pipeline1_out)
+            const bin = await binarizeVolumeDataTensor(pipeline1_out)
             outLabelVolume = outLabelVolume.mul(bin)
           }
         }
@@ -771,7 +795,7 @@ async function inferenceFullVolumePhase2(
           const Vshape = outLabelVolume.shape
           const Vtype = outLabelVolume.dtype
           tf.dispose(outLabelVolume)
-          tf.engine().endScope()
+          safeEndScope()
           tf.engine().disposeVariables()
           outimg = await generateOutputSlicesV2(
             img,
@@ -788,7 +812,7 @@ async function inferenceFullVolumePhase2(
           console.log(' Phase-2 num of tensors after generateOutputSlicesV2: ', tf.memory().numTensors)
         } catch (error) {
           // -- Timing data to collect
-          tf.engine().endScope()
+          safeEndScope()
           tf.engine().disposeVariables()
 
           const errTxt = 'Failed while generating output due to limited browser memory available'
@@ -956,7 +980,7 @@ async function inferenceFullVolumePhase1(
           const errTxt = 'Your graphics card (e.g. Intel) may not be compatible with WebGL. ' + err.message
           callbackUI(errTxt, -1, errTxt)
 
-          tf.engine().endScope()
+          safeEndScope()
           tf.engine().disposeVariables()
 
           statData.Inference_t = Infinity
@@ -976,7 +1000,7 @@ async function inferenceFullVolumePhase1(
         callbackUI('Layer ' + i.toString(), (i + 1) / layersLength)
         if (tf.memory().unreliable) {
           const unreliableReasons = 'unreliable reasons :' + tf.memory().reasons
-          callbackUI(unreliableReasons, NaN, unreliableReasons)
+          callbackUI(unreliableReasons, NaN)
         }
 
         if (i === layersLength - 1) {
@@ -1012,9 +1036,9 @@ async function inferenceFullVolumePhase1(
                 const errTxt = "argMax buffer couldn't be created due to limited memory resources."
                 callbackUI(errTxt, -1, errTxt)
 
-                prediction_argmax.dispose()
+                prediction_argmax?.dispose()
 
-                tf.engine().endScope()
+                safeEndScope()
                 tf.engine().disposeVariables()
 
                 statData.Inference_t = Infinity
@@ -1032,9 +1056,9 @@ async function inferenceFullVolumePhase1(
               const errTxt = "argMax buffer couldn't be created due to limited memory resources."
               callbackUI(errTxt, -1, errTxt)
 
-              prediction_argmax.dispose()
+              prediction_argmax?.dispose()
 
-              tf.engine().endScope()
+              safeEndScope()
               tf.engine().disposeVariables()
 
               statData.Inference_t = Infinity
@@ -1091,15 +1115,15 @@ async function inferenceFullVolumePhase1(
               slice_width,
               modelEntry,
               opts,
-              niftiHeader,
-              niftiImage,
+              callbackUI, // upstream passava niftiHeader/niftiImage nas posições de callbackUI/callbackImg
+              callbackImg,
               false
             )
             await tf.dispose(outLabelVolume)
             console.log(' Phase-1 num of tensors after generateBrainMask: ', tf.memory().numTensors)
           } catch (error) {
             // -- Timing data to collect
-            tf.engine().endScope()
+            safeEndScope()
             tf.engine().disposeVariables()
 
             const errTxt = 'Failed while generating pre-model output due to limited browser memory available'
@@ -1173,6 +1197,7 @@ async function inferenceFullVolumePhase1(
                   opts,
                   niftiImage
                 )
+                return 0 // sem isso o laço seguia aplicando camadas do pré-modelo e sobrescrevia o erro real
                 // inferenceFullVolumePhase2(model, slices_3d.transpose(), num_of_slices, slice_height, slice_width, slices_3d_mask)
               }
             } else {
@@ -1225,7 +1250,7 @@ async function inferenceFullVolumePhase1(
       } else {
         // Voxel cropping BUT no seq conv
         // todo: we do not use result const outimg = await
-        inferenceFullVolumePhase2(
+        await inferenceFullVolumePhase2(
           model,
           slices_3d,
           num_of_slices,
@@ -1295,8 +1320,8 @@ async function runInferenceWW(opts, modelEntry, niftiHeader, niftiImage) {
   tf.engine().startScope()
   console.log('Batch size: ', batchSize)
   console.log('Num of Channels: ', numOfChan)
+  await enableProductionMode(true, modelEntry.isNvidia === true)
   const model = await load_model(/^https?:\/\//i.test(modelEntry.path) ? modelEntry.path : opts.rootURL + modelEntry.path)
-  await enableProductionMode(true, (model && modelEntry.isNvidia === true))
   statData.TF_Backend = tf.getBackend()
   const modelObject = model
   let batchInputShape = []
@@ -1394,7 +1419,11 @@ self.addEventListener(
   'message',
   function (event) {
     preferredBackend = event.data.opts.backend || 'webgl'
+    imgSent = false
+    lastModal = ''
     runInferenceWW(event.data.opts, event.data.modelEntry, event.data.niftiHeader, event.data.niftiImage)
+      .then(() => { if (!imgSent) self.postMessage({ cmd: 'fatal', message: lastModal || 'a inferência terminou sem produzir segmentação', backend: tf.getBackend() }) })
+      .catch((err) => self.postMessage({ cmd: 'fatal', message: (err && err.message) || String(err), backend: tf.getBackend() }))
   },
   false
 )

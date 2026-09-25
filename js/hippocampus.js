@@ -101,24 +101,26 @@ export function hippoToCSV(result, meta) {
   const esc = (v) => (v == null ? '' : typeof v === 'number' ? (Number.isInteger(v) ? String(v) : v.toFixed(3)) : `"${String(v).replace(/"/g, '""')}"`)
   const head = ['subject_id', 'session', 'model', 'quality_tier', 'pipeline', 'hemisphere', 'part', 'part_pt',
     'voxels', 'volume_mm3', 'length_mm', 'mean_xsec_mm2', 'eq_diameter_mm', 'mean_intensity', 'sd_intensity',
-    'centroid_x', 'centroid_y', 'centroid_z', 'surface_mm2', 'sphericity', 'edge_contrast', 'qc_flags']
+    'centroid_x', 'centroid_y', 'centroid_z', 'surface_mm2', 'sphericity', 'edge_contrast', 'qc_flags', 'ai_pct']
   const rows = [head.join(',')]
   const pre = [meta.subjectId, meta.session, meta.modelKey, meta.qualityTier, meta.pipeline]
   for (const [hemi, key] of [['L', 'left'], ['R', 'right']]) {
     const s = result[key]
     if (!s) continue
     rows.push([...pre, hemi, 'whole', 'hipocampo inteiro', s.voxels_refined, s.volume_mm3, s.axis_length_mm, s.mean_xsec_mm2,
-      s.eq_diameter_mm, s.intensity_median, s.intensity_sigma, ...(s.centroid_ras_mm || ['', '', '']),
-      s.surface_mm2, s.sphericity, s.edge_contrast, s.qc_flags.join('; ')].map(esc).join(','))
+      s.eq_diameter_mm, s.mean_intensity, s.sd_intensity, ...(s.centroid_ras_mm || ['', '', '']),
+      s.surface_mm2, s.sphericity, s.edge_contrast, s.qc_flags.join('; '), ''].map(esc).join(','))
     for (const p of ['head', 'body', 'tail']) {
       const P = s[p]
       rows.push([...pre, hemi, p, PART_PT[p], P.voxels, P.volume_mm3, P.length_mm, P.mean_xsec_mm2, P.eq_diameter_mm,
-        P.mean_intensity, P.sd_intensity, ...(P.centroid_ras_mm || ['', '', '']), '', '', '', ''].map(esc).join(','))
+        P.mean_intensity, P.sd_intensity, ...(P.centroid_ras_mm || ['', '', '']), '', '', '', '', ''].map(esc).join(','))
     }
   }
   if (result.asymmetry?.total_pct != null) {
-    rows.push([...pre, '', 'asymmetry_total', 'IA total %', '', result.asymmetry.total_pct, '', '', '', '', '', '', '', '', '', '', '', ''].map(esc).join(','))
-    for (const p of ['head', 'body', 'tail']) rows.push([...pre, '', `asymmetry_${p}`, `IA ${PART_PT[p]} %`, '', result.asymmetry[`${p}_pct`], '', '', '', '', '', '', '', '', '', '', '', ''].map(esc).join(','))
+    // assimetria em coluna própria (antes ia para volume_mm3)
+    const blank = Array(head.length - pre.length - 4).fill('')
+    rows.push([...pre, '', 'asymmetry_total', 'IA total %', ...blank, result.asymmetry.total_pct].map(esc).join(','))
+    for (const p of ['head', 'body', 'tail']) rows.push([...pre, '', `asymmetry_${p}`, `IA ${PART_PT[p]} %`, ...blank, result.asymmetry[`${p}_pct`]].map(esc).join(','))
   }
   return '\ufeff' + rows.join('\r\n')
 }

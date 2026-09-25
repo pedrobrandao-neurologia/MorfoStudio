@@ -203,35 +203,43 @@ function analyseSide({ side, voxels, labels, intensity, dims, affine, claimable,
   // ---- 2. refinamento por intensidade (opcional)
   let grown = 0, removedOutliers = 0, filled = 0
   const stats0 = medianMAD(Array.from({ length: bn }, (_, i) => i).filter((i) => mask[i]).map((i) => inten[i]))
-  if (opt.refine && stats0.sigma > 0.5) {
+  const removedMask = new Uint8Array(bn)
+  if (opt.refine !== false && stats0.sigma > 0.5) {
     const kGrow = opt.kGrow ?? 2.0
     const kOutlier = opt.kOutlier ?? 3.5
-    // crescimento geodésico limitado (2 iterações, 6-viz), apenas sobre rótulos reivindicáveis
+    // crescimento geodésico limitado (2 iterações, 6-viz), apenas sobre rótulos reivindicáveis e só em
+    // CONCAVIDADES (≥ 4 dos 6 vizinhos já na máscara): o córtex adjacente tem a mesma intensidade do hipocampo,
+    // e aceitar 1 vizinho acrescentava uma casca inteira de 1 voxel por iteração (+30–70 % de volume)
+    const minIn = opt.growMinNeighbours ?? 4
     for (let it = 0; it < (opt.growIters ?? 2); it++) {
       const cand = []
       for (let z = 0; z < bz; z++) for (let y = 0; y < by; y++) for (let x = 0; x < bx; x++) {
         const i = x + y * bx + z * bx * by
         if (mask[i] || !claimable.has(lab[i])) continue
         if (Math.abs(inten[i] - stats0.median) > kGrow * stats0.sigma) continue
+        let nIn = 0
         for (const [dx, dy, dz] of NB6) {
           const X = x + dx, Y = y + dy, Z = z + dz
           if (X < 0 || Y < 0 || Z < 0 || X >= bx || Y >= by || Z >= bz) continue
-          if (mask[X + Y * bx + Z * bx * by]) { cand.push(i); break }
+          if (mask[X + Y * bx + Z * bx * by]) nIn++
         }
+        if (nIn >= minIn) cand.push(i)
       }
       for (const i of cand) mask[i] = 1
       grown += cand.length
       if (!cand.length) break
     }
-    // remoção de outliers (ex.: líquor do corno temporal incluído no rótulo)
-    for (let i = 0; i < bn; i++) {
-      if (mask[i] && Math.abs(inten[i] - stats0.median) > kOutlier * stats0.sigma) { mask[i] = 0; removedOutliers++ }
-    }
-    // fechamento morfológico 6-viz (raio 1): operação extensiva, contém a máscara original
+    // fechamento morfológico 6-viz (raio 1) ANTES da remoção de outliers — senão o fechamento e o
+    // preenchimento de cavidades devolviam à máscara os voxels removidos
     const closed = erode6(dilate6(mask, bdims), bdims)
     mask.set(closed)
+    // remoção de outliers (ex.: líquor do corno temporal incluído no rótulo)
+    for (let i = 0; i < bn; i++) {
+      if (mask[i] && Math.abs(inten[i] - stats0.median) > kOutlier * stats0.sigma) { mask[i] = 0; removedMask[i] = 1; removedOutliers++ }
+    }
   }
   filled = fillCavities(mask, bdims)
+  for (let i = 0; i < bn; i++) if (removedMask[i] && mask[i]) { mask[i] = 0; filled-- } // outliers continuam fora
   const cc = largestComponent(mask, bdims)
   let nVox = 0; for (let i = 0; i < bn; i++) if (mask[i]) nVox++
   if (nVox < 200) throw new Error(`${side}: máscara final com apenas ${nVox} voxels — hipocampo não confiável nesta segmentação`)
@@ -330,8 +338,11 @@ function analyseSide({ side, voxels, labels, intensity, dims, affine, claimable,
     const s = binSum[b]
     s[0] += ras[k * 3]; s[1] += ras[k * 3 + 1]; s[2] += ras[k * 3 + 2]; s[3]++
   }
-  const centroids = []
-  for (let b = 0; b < NBINS; b++) if (binSum[b][3] > 0) centroids.push({ b, p: [binSum[b][0] / binSum[b][3], binSum[b][1] / binSum[b][3], binSum[b][2] / binSum[b][3]] })
+  const raw = []
+  for (let b = 0; b < NBINS; b++) if (binSum[b][3] > 0) raw.push({ b, p: [binSum[b][0] / binSum[b][3], binSum[b][1] / binSum[b][3], binSum[b][2] / binSum[b][3]] })
+  // média móvel de 3 pontos (extremos fixos): o serrilhado dos centroides de bins de ~1 mm inflava o comprimento
+  const centroids = raw.map((c, k) => (k === 0 || k === raw.length - 1) ? c
+    : { b: c.b, p: [0, 1, 2].map((d) => (raw[k - 1].p[d] + c.p[d] + raw[k + 1].p[d]) / 3) })
   let axisLength = 0
   const cum = [0]
   for (let c = 1; c < centroids.length; c++) {
@@ -341,9 +352,26 @@ function analyseSide({ side, voxels, labels, intensity, dims, affine, claimable,
       centroids[c].p[2] - centroids[c - 1].p[2])
     cum.push(axisLength)
   }
-  // φ (centro do bin) → fração de arco; interpolação linear
-  const phiKnots = centroids.map((c) => (c.b + 0.5) / NBINS)
-  const sKnots = cum.map((c) => (axisLength > 0 ? c / axisLength : 0))
+  // a polilinha vai do centroide do 1º ao do último bin; as pontas (tampas φ=0/1) ficam além dela.
+  // Estende cada extremidade até o voxel mais distante da tampa na direção da ponta (senão o eixo
+  // era subestimado ~9 %, enviesando comprimentos, secções e o alerta de QC)
+  let ext0 = 0, ext1 = 0
+  if (centroids.length >= 2) {
+    const endDir = (a, b) => { const d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; const n = Math.hypot(...d) || 1; return d.map((v) => v / n) }
+    const c0 = centroids[0], c1 = centroids[centroids.length - 1]
+    const d0 = endDir(c0.p, centroids[1].p), d1 = endDir(c1.p, centroids[centroids.length - 2].p)
+    for (let k = 0; k < nVox; k++) {
+      const b = Math.min(NBINS - 1, Math.max(0, Math.floor(phi[idxs[k]] * NBINS)))
+      const px = ras[k * 3], py = ras[k * 3 + 1], pz = ras[k * 3 + 2]
+      if (b === c0.b) ext0 = Math.max(ext0, (px - c0.p[0]) * d0[0] + (py - c0.p[1]) * d0[1] + (pz - c0.p[2]) * d0[2])
+      if (b === c1.b) ext1 = Math.max(ext1, (px - c1.p[0]) * d1[0] + (py - c1.p[1]) * d1[1] + (pz - c1.p[2]) * d1[2])
+    }
+  }
+  const innerLength = axisLength
+  axisLength = innerLength + ext0 + ext1
+  // φ (centro do bin) → fração de arco; interpolação linear, com as pontas φ=0 → s=0 e φ=1 → s=1
+  const phiKnots = [0, ...centroids.map((c) => (c.b + 0.5) / NBINS), 1]
+  const sKnots = [0, ...cum.map((c) => (axisLength > 0 ? (c + ext0) / axisLength : 0)), 1]
   const phiToS = (p) => {
     if (p <= phiKnots[0]) return sKnots[0]
     for (let c = 1; c < phiKnots.length; c++) {
@@ -401,6 +429,8 @@ function analyseSide({ side, voxels, labels, intensity, dims, affine, claimable,
     }
   }
   const csum = ['sx', 'sy', 'sz'].map((k) => parts.head[k] + parts.body[k] + parts.tail[k])
+  const sI = parts.head.si + parts.body.si + parts.tail.si, sI2 = parts.head.si2 + parts.body.si2 + parts.tail.si2
+  const meanAll = sI / nVox
   const result = {
     side,
     voxels_label: rawVoxels, voxels_refined: nVox,
@@ -414,6 +444,7 @@ function analyseSide({ side, voxels, labels, intensity, dims, affine, claimable,
     mean_xsec_mm2: meanXsec,
     eq_diameter_mm: meanXsec != null ? 2 * Math.sqrt(meanXsec / Math.PI) : null,
     max_inscribed_diameter_mm: (2 * maxEDT) / 3,
+    mean_intensity: meanAll, sd_intensity: Math.sqrt(Math.max(0, sI2 / nVox - meanAll * meanAll)),
     surface_mm2: surface, sphericity,
     edge_contrast: edgeFaces ? edgeContrastSum / edgeFaces : null,
     intensity_median: stats0.median, intensity_sigma: stats0.sigma,
@@ -443,9 +474,12 @@ self.onmessage = (e) => {
     const leftSet = new Set(hippoIds.left || []), rightSet = new Set(hippoIds.right || [])
     const claimable = new Set(claimableIds || [])
     progress('Localizando hipocampos na segmentação…', 0.05)
-    // separa voxels por hemisfério: por rótulo L/R quando houver; senão pelo sinal de x em RAS
+    // separa voxels por hemisfério: por rótulo L/R quando houver; senão pela linha média ESTIMADA dos
+    // dados — o x=0 do arquivo é o centro do FOV/scanner, não a linha média do cérebro (um hipocampo
+    // deslocado era cortado ao meio e perdido pelo maior-componente)
     const leftVox = [], rightVox = []
     const a = affine
+    const mergedIdx = [], mergedX = []
     for (let i = 0; i < labels.length; i++) {
       const l = labels[i]
       if (!hippoSet.has(l)) continue
@@ -453,12 +487,26 @@ self.onmessage = (e) => {
       else if (rightSet.has(l)) rightVox.push(i)
       else {
         const z = (i / NXY) | 0, y = ((i / NX) | 0) % dims[1], x = i % NX
-        const rasX = a[0] * x + a[1] * y + a[2] * z + a[3]
-        if (rasX < 0) leftVox.push(i); else rightVox.push(i)
+        mergedIdx.push(i); mergedX.push(a[0] * x + a[1] * y + a[2] * z + a[3])
       }
     }
+    let midX = null
+    if (mergedIdx.length) {
+      // 2-médias 1D em x RAS, iniciando na média: converge para o ponto entre os dois hipocampos
+      let t = mergedX.reduce((p, v) => p + v, 0) / mergedX.length
+      for (let it = 0; it < 50; it++) {
+        let s0 = 0, n0 = 0, s1 = 0, n1 = 0
+        for (const v of mergedX) { if (v < t) { s0 += v; n0++ } else { s1 += v; n1++ } }
+        if (!n0 || !n1) break
+        const nt = (s0 / n0 + s1 / n1) / 2
+        if (Math.abs(nt - t) < 1e-3) { t = nt; break }
+        t = nt
+      }
+      midX = t
+      for (let k = 0; k < mergedIdx.length; k++) (mergedX[k] < midX ? leftVox : rightVox).push(mergedIdx[k])
+    }
     const lateralized = leftSet.size > 0 || rightSet.size > 0
-    log.push(`hemisférios por ${lateralized ? 'rótulos L/R do modelo' : 'linha média (x=0 em RAS), aproximado'}`)
+    log.push(`hemisférios por ${lateralized ? 'rótulos L/R do modelo' : `linha média estimada entre os hipocampos (x RAS = ${midX?.toFixed(1)} mm)`}`)
     if (leftVox.length < 200 && rightVox.length < 200) throw new Error('a segmentação não contém voxels suficientes de hipocampo — use um modelo aseg/aparc+aseg')
     const out = new Uint8Array(labels.length)
     const sides = {}
@@ -466,14 +514,19 @@ self.onmessage = (e) => {
     for (const [name, vox, base] of [['esquerdo', leftVox, 1], ['direito', rightVox, 4]]) {
       if (vox.length < 200) { log.push(`${name}: ${vox.length} voxels — hemisfério ignorado`); continue }
       progress(`Hipocampo ${name}: refinamento e coordenadas de Laplace…`, 0.15 + 0.4 * step)
-      const { result, writeLabels } = analyseSide({
-        side: name, voxels: vox, labels, intensity, dims, affine,
-        claimable, options: opt, log
-      })
-      writeLabels(out, base)
-      sides[name === 'esquerdo' ? 'left' : 'right'] = result
+      try {
+        const { result, writeLabels } = analyseSide({
+          side: name, voxels: vox, labels, intensity, dims, affine,
+          claimable, options: opt, log
+        })
+        writeLabels(out, base)
+        sides[name === 'esquerdo' ? 'left' : 'right'] = result
+      } catch (err) {
+        log.push(`${name}: análise falhou — ${err.message}`) // o outro lado segue
+      }
       step++
     }
+    if (!sides.left && !sides.right) throw new Error('nenhum hipocampo pôde ser analisado: ' + log.slice(-2).join(' · '))
     // assimetria por subregião
     const asymmetry = {}
     if (sides.left && sides.right) {

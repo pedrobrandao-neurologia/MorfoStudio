@@ -22,23 +22,33 @@ function progress(message, frac) { post({ cmd: 'progress', message, frac }) }
 
 const R_REPORT_MM = 80 // raio usado só para RESUMIR rotação como deslocamento (mm) no relatório
 
-/** winsoriza [q0.001, q0.999] e reescala para [0,1], como o PreprocessImage do antsMotionCorr */
-function winsorize(img) {
-  const sorted = Float32Array.from(img).sort()
-  const lo = sorted[Math.floor(0.001 * (sorted.length - 1))]
-  const hi = sorted[Math.floor(0.999 * (sorted.length - 1))]
-  const out = new Float32Array(img.length)
-  const sc = hi > lo ? 1 / (hi - lo) : 0
-  for (let i = 0; i < img.length; i++) {
-    const v = img[i] < lo ? lo : img[i] > hi ? hi : img[i]
-    out[i] = (v - lo) * sc
-  }
-  return out
+/** quantis [q0.001, q0.999] por histograma de 4096 bins (a ordenação completa custava ~2,4 s e 67 MB por volume) */
+function robustRange(img) {
+  let mn = Infinity, mx = -Infinity
+  for (let i = 0; i < img.length; i++) { const v = img[i]; if (v < mn) mn = v; if (v > mx) mx = v }
+  if (!(mx > mn)) return [mn, mn + 1]
+  const NB = 4096, h = new Float64Array(NB), sc = (NB - 1) / (mx - mn)
+  for (let i = 0; i < img.length; i++) h[Math.round((img[i] - mn) * sc)]++
+  const q = (p) => { const target = p * img.length; let c = 0; for (let b = 0; b < NB; b++) { c += h[b]; if (c >= target) return mn + b / sc } return mx }
+  const lo = q(0.001), hi = q(0.999)
+  return hi > lo ? [lo, hi] : [mn, mx]
+}
+
+/**
+ * Pirâmide winsorizada ([q0.001,q0.999]→[0,1], como o PreprocessImage do antsMotionCorr) nos níveis
+ * usados pelo registro. Guarda só os níveis reduzidos — nunca uma cópia winsorizada em resolução cheia.
+ */
+function regPyramid(img, dims) {
+  const [lo, hi] = robustRange(img)
+  const sc = 1 / (hi - lo)
+  const lv = {}
+  for (const s of [4, 2]) lv[s] = shrinkVolume(img, dims, s, lo, hi, sc)
+  return lv
 }
 
 // ---------------------------------------------------------------- pirâmide: média de blocos s×s×s
-function shrinkVolume(img, dims, s) {
-  if (s <= 1) return { img, dims: [...dims] }
+function shrinkVolume(img, dims, s, lo = -Infinity, hi = Infinity, wsc = 1) {
+  const clampNorm = Number.isFinite(lo)
   const [nx, ny, nz] = dims
   const sx = Math.max(1, Math.floor(nx / s)), sy = Math.max(1, Math.floor(ny / s)), sz = Math.max(1, Math.floor(nz / s))
   const out = new Float32Array(sx * sy * sz)
@@ -50,7 +60,9 @@ function shrinkVolume(img, dims, s) {
       for (let x = 0; x < nx; x++) {
         const xx = Math.min(sx - 1, (x / s) | 0)
         const j = xx + yy * sx + zz * sx * sy
-        out[j] += img[x + y * nx + z * nx * ny]; cnt[j]++
+        let v = img[x + y * nx + z * nx * ny]
+        if (clampNorm) v = ((v < lo ? lo : v > hi ? hi : v) - lo) * wsc
+        out[j] += v; cnt[j]++
       }
     }
   }
@@ -164,44 +176,57 @@ function cost(params, samples, mov, mdims, pixdims, center, metric) {
   return -(covFM / Math.sqrt(vF * vM)) // −NCC
 }
 
-/** registro rígido da imagem móvel à referência, multirresolução, busca local coordenada */
-function rigidRegister(ref, mov, dims, pixdims, options, tag) {
+/** centro de massa (mm, coordenadas da RESOLUÇÃO CHEIA) de um nível de pirâmide s, ponderado acima de Otsu */
+function levelCenter(lv, s, pixdims) {
+  const { img, dims } = lv
+  const thr = otsu(img)
+  const [nx, ny, nz] = dims
+  let cx = 0, cy = 0, cz = 0, cw = 0
+  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+    const w = img[x + y * nx + z * nx * ny]
+    if (w > thr) { cx += x * w; cy += y * w; cz += z * w; cw += w }
+  }
+  if (!cw) return [nx * s / 2 * pixdims[0], ny * s / 2 * pixdims[1], nz * s / 2 * pixdims[2]]
+  // voxel reduzido x ↔ centro do bloco s×s×s na resolução cheia: x·s + (s−1)/2
+  const off = (s - 1) / 2
+  return [(cx / cw * s + off) * pixdims[0], (cy / cw * s + off) * pixdims[1], (cz / cw * s + off) * pixdims[2]]
+}
+
+/**
+ * Registro rígido móvel → referência (pirâmides winsorizadas), busca local coordenada multirresolução.
+ * `center` (mm, resolução cheia) é o MESMO centro de rotação usado depois em resampleRigid —
+ * antes o custo usava o centroide das amostras reduzidas e a reamostragem outro centro (erro ~(R−I)·Δc, ~2 mm).
+ */
+function rigidRegister(refPyr, movPyr, pixdims, center, options, tag) {
   const metric = options.metric || 'mi'
   const levels = [
     { shrink: 4, stride: 1, step0: 4, minStep: 0.25, maxIter: 60 },
     { shrink: 2, stride: 2, step0: 1, minStep: 0.1, maxIter: 40 }
   ]
-  // inicialização por momentos (como o itkImageMomentsCalculator do antsMotionCorr):
-  // translação inicial = COG(móvel) − COG(fixa)
-  const cogF = centerOfMass(ref, dims, pixdims)
-  const cogM = centerOfMass(mov, dims, pixdims)
+  // inicialização por momentos (itkImageMomentsCalculator do antsMotionCorr): t0 = COG(móvel) − COG(fixa)
+  const cogF = levelCenter(refPyr[2], 2, pixdims), cogM = levelCenter(movPyr[2], 2, pixdims)
   let params = [cogM[0] - cogF[0], cogM[1] - cogF[1], cogM[2] - cogF[2], 0, 0, 0]
   for (const lv of levels) {
-    const rs = shrinkVolume(ref, dims, lv.shrink)
-    const ms = shrinkVolume(mov, dims, lv.shrink)
+    const rs = refPyr[lv.shrink], ms = movPyr[lv.shrink]
     const pd = pixdims.map((p) => p * lv.shrink)
     const samples = buildSamples(rs.img, rs.dims, pd, lv.stride)
     if (samples.vals.length < 200) continue
-    // faixas dos histogramas para a MI
     let fLo = Infinity, fHi = -Infinity
     for (const v of samples.vals) { if (v < fLo) fLo = v; if (v > fHi) fHi = v }
     let mLo = Infinity, mHi = -Infinity
     for (let i = 0; i < ms.img.length; i += 7) { const v = ms.img[i]; if (v < mLo) mLo = v; if (v > mHi) mHi = v }
     samples.fLo = fLo; samples.fSc = 31.999 / Math.max(1e-6, fHi - fLo)
     samples.mLo = mLo; samples.mSc = 31.999 / Math.max(1e-6, mHi - mLo)
-    // centro de massa da referência (mm)
-    let cx = 0, cy = 0, cz = 0, cw = 0
-    for (let k = 0; k < samples.vals.length; k++) { const w = samples.vals[k]; cx += samples.pts[k * 3] * w; cy += samples.pts[k * 3 + 1] * w; cz += samples.pts[k * 3 + 2] * w; cw += w }
-    const center = [cx / cw, cy / cw, cz / cw]
-    // escalas físicas (RegistrationParameterScalesFromPhysicalShift do ANTs): o passo de rotação
-    // é o passo em mm dividido pelo maior raio dos pontos amostrados em torno do centro,
-    // de modo que cada passo produza no máximo ~step mm de deslocamento físico
+    // o grid reduzido começa (s−1)/2 voxels cheios adiante: o mesmo ponto físico do centro nesse grid
+    const off = (lv.shrink - 1) / 2
+    const cLevel = [center[0] - off * pixdims[0], center[1] - off * pixdims[1], center[2] - off * pixdims[2]]
+    // escalas físicas (RegistrationParameterScalesFromPhysicalShift do ANTs): passo de rotação = passo mm / maior raio
     let rMax = 1
     for (let k = 0; k < samples.vals.length; k++) {
-      const d = Math.hypot(samples.pts[k * 3] - center[0], samples.pts[k * 3 + 1] - center[1], samples.pts[k * 3 + 2] - center[2])
+      const d = Math.hypot(samples.pts[k * 3] - cLevel[0], samples.pts[k * 3 + 1] - cLevel[1], samples.pts[k * 3 + 2] - cLevel[2])
       if (d > rMax) rMax = d
     }
-    const evalCost = (p) => cost(p, samples, ms.img, ms.dims, pd, center, metric)
+    const evalCost = (p) => cost(p, samples, ms.img, ms.dims, pd, cLevel, metric)
     let best = evalCost(params)
     let step = lv.step0
     for (let it = 0; it < lv.maxIter && step >= lv.minStep; it++) {
@@ -240,16 +265,6 @@ function resampleRigid(mov, dims, pixdims, params, center) {
   return out
 }
 
-function centerOfMass(img, dims, pixdims) {
-  const [nx, ny, nz] = dims
-  let cx = 0, cy = 0, cz = 0, cw = 0
-  for (let z = 0; z < nz; z += 2) for (let y = 0; y < ny; y += 2) for (let x = 0; x < nx; x += 2) {
-    const w = img[x + y * nx + z * nx * ny]
-    if (w > 0) { cx += x * w; cy += y * w; cz += z * w; cw += w }
-  }
-  return cw ? [cx / cw * pixdims[0], cy / cw * pixdims[1], cz / cw * pixdims[2]] : [nx / 2 * pixdims[0], ny / 2 * pixdims[1], nz / 2 * pixdims[2]]
-}
-
 // ---------------------------------------------------------------- entrada
 self.onmessage = (e) => {
   const { volumes, dims, pixdims, options } = e.data
@@ -258,31 +273,32 @@ self.onmessage = (e) => {
     const opt = options || {}
     const nVol = volumes.length
     if (nVol < 2) throw new Error('correção de movimento requer pelo menos 2 volumes')
-    const vols = volumes.map((v) => new Float32Array(v))
-    // o registro usa cópias winsorizadas [0,001–0,999]→[0,1] (PreprocessImage do antsMotionCorr);
-    // a reamostragem final usa as intensidades originais
-    const regVols = vols.map(winsorize)
+    const vols = volumes // Float32Array transferidos pelo app: sem cópia
     const n = dims[0] * dims[1] * dims[2]
+    // o registro usa só pirâmides winsorizadas (níveis 4 e 2); a reamostragem usa as intensidades originais
+    const pyrs = vols.map((v) => regPyramid(v, dims))
     const log = [`${nVol} volumes ${dims.join('×')} — métrica ${opt.metric || 'mi'} (rígido 6-DOF, 2 passadas, winsorização 0,1–99,9 %)`]
     // passada 1: referência = volume 0; passada 2: referência = média alinhada (como -u 1 do antsMotionCorr)
     let reference = vols[0]
-    let refReg = regVols[0]
-    let paramsAll = vols.map(() => [0, 0, 0, 0, 0, 0])
+    let refPyr = pyrs[0]
+    const paramsAll = vols.map(() => [0, 0, 0, 0, 0, 0])
+    let center = null
     for (let pass = 0; pass < 2; pass++) {
-      const aligned = new Array(nVol)
+      center = levelCenter(refPyr[2], 2, pixdims) // um único centro por passada: custo E reamostragem
+      const mean = new Float32Array(n) // média corrente: não guarda todos os volumes alinhados
       for (let v = 0; v < nVol; v++) {
         progress(`Passada ${pass + 1}/2 — volume ${v + 1}/${nVol}: registro rígido…`, (pass * nVol + v) / (2 * nVol))
-        if (pass === 0 && v === 0) { aligned[0] = vols[0]; continue }
-        const p = rigidRegister(refReg, regVols[v], dims, pixdims, opt, `vol ${v + 1}`)
-        paramsAll[v] = p
-        const center = centerOfMass(refReg, dims, pixdims)
-        aligned[v] = resampleRigid(vols[v], dims, pixdims, p, center)
+        let aligned
+        if (pass === 0 && v === 0) aligned = vols[0]
+        else {
+          const p = rigidRegister(refPyr, pyrs[v], pixdims, center, opt, `vol ${v + 1}`)
+          paramsAll[v] = p
+          aligned = resampleRigid(vols[v], dims, pixdims, p, center)
+        }
+        for (let i = 0; i < n; i++) mean[i] += aligned[i] / nVol
       }
-      // média dos alinhados vira a nova referência
-      const mean = new Float32Array(n)
-      for (const a of aligned) for (let i = 0; i < n; i++) mean[i] += a[i] / nVol
       reference = mean
-      refReg = winsorize(mean)
+      refPyr = regPyramid(mean, dims)
     }
     // resultado: média final + parâmetros por volume
     const params = paramsAll.map((p, v) => ({
@@ -293,7 +309,8 @@ self.onmessage = (e) => {
     }))
     const meanDisp = params.reduce((s, p) => s + p.displacement_mm, 0) / Math.max(1, nVol - 1)
     log.push(`deslocamento médio (translação + ${R_REPORT_MM} mm × rotação): ${meanDisp.toFixed(2)} mm`)
-    post({ cmd: 'done', img: reference, params, meanDisplacement: meanDisp, log, elapsed_ms: Date.now() - t0 }, [reference.buffer])
+    // parâmetros no referencial dos eixos de voxel × pixdim, em torno de rotationCenter_mm (não RAS)
+    post({ cmd: 'done', img: reference, params, rotationCenter_mm: center, meanDisplacement: meanDisp, log, elapsed_ms: Date.now() - t0 }, [reference.buffer])
   } catch (err) {
     post({ cmd: 'error', message: err.message || String(err) })
   }

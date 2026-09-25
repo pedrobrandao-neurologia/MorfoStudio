@@ -4,10 +4,13 @@
 export function detectContrast({ sidecar = {}, fileName = '', description = '' }) {
   const txt = `${sidecar.SeriesDescription || ''} ${sidecar.ProtocolName || ''} ${sidecar.SequenceName || ''} ${fileName} ${description}`.toLowerCase()
   const imageType = (sidecar.ImageType || []).join(' ').toLowerCase()
-  if ((sidecar.Modality || '').toUpperCase() === 'CT' || /\bct\b|tomograf/.test(txt)) return 'CT'
+  // Modality do cabeçalho manda; o nome do arquivo só decide quando ela falta ("CT-123" num MR não vira TC)
+  const modality = (sidecar.Modality || '').toUpperCase()
+  if (modality === 'CT' || (!modality && /\bct\b|tomograf/.test(txt))) return 'CT'
   if (/flair|dark.?fluid|tirm/.test(txt)) return 'FLAIR'
   if (/\bt2\b|t2w|tse|fse|space_t2/.test(txt) && !/t1/.test(txt)) return 'T2'
-  if (/\bpd\b|proton/.test(txt)) return 'PD'
+  // "PD" também é sigla de Parkinson em nomes de coorte (ex.: PD-012_T1_MPRAGE): só vale sem marcador de T1
+  if (/\bpd\b|proton/.test(txt) && !/t1|mprage|mp2rage|spgr|bravo|tfe|rage/.test(txt)) return 'PD'
   if (/t1|mprage|mp2rage|spgr|bravo|tfe|fspgr|3d_t1|rage/.test(txt)) return 'T1'
   if (/swi|swan|venobold/.test(txt)) return 'SWI'
   if (/dwi|dti|diffusion|adc|trace/.test(txt)) return 'DWI'
@@ -30,7 +33,9 @@ export function detectContrast({ sidecar = {}, fileName = '', description = '' }
 export function assessQuality({ pixDims, dims, contrast, sidecar = {} }) {
   const vox = pixDims.slice(0, 3).map((v) => Math.abs(v) || 1)
   const voxMin = Math.min(...vox), voxMax = Math.max(...vox)
-  const thickAxis = vox.indexOf(voxMax)
+  // eixo de corte: o mais espesso; em empate (isotrópico), o de menos voxels (ex.: 176 cortes de 256×256×176)
+  let thickAxis = 0
+  for (let i = 1; i < 3; i++) if (vox[i] > vox[thickAxis] + 1e-6 || (Math.abs(vox[i] - vox[thickAxis]) <= 1e-6 && dims[i] < dims[thickAxis])) thickAxis = i
   const nSlices = dims[thickAxis]
   const fov = dims.map((n, i) => n * vox[i])
   const aniso = voxMax / voxMin

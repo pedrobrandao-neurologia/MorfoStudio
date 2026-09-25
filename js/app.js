@@ -8,17 +8,21 @@ import { writeSav } from './sav.js'
 import { writeZip } from './zip.js'
 import { detectContrast, assessQuality, renderRuler } from './quality.js'
 import { buildReport } from './report.js'
+import { FS_LUT } from './fs-lut.js'
 import { hasHippocampus, runHippoWorker, buildHippoOverlay, hippoNiftiGz, hippoToCSV, hippoWideColumns, hippoColor } from './hippocampus.js'
 
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 const $ = (id) => document.getElementById(id)
 
 // ids do brainchop-parameters.js (1-indexado): [memória alta, memória baixa]
+// minVox: limite inferior do recorte que entra na rede (pré-modelo de máscara ≈ 3 M voxels; limiar de
+// intensidade sobre a cabeça ≈ 8 M) — usado para prever estouro do limite de textura WebGL
 const MODELS = {
-  aparc_aseg_104: { label: 'aparc+aseg 104 classes (L/R, cerebelo, tronco, corpo caloso)', ids: [14, 15] },
-  aparc_aseg_50: { label: 'aparc+aseg 50 classes (homólogos fundidos)', ids: [8, 9] },
-  aseg_18: { label: 'aseg 18 classes (subcortical + tecidos)', ids: [4, 5] },
-  tissue_3: { label: 'tecidos: cinzenta / branca / líquor', ids: [2, 3] },
+  fusion: { label: 'fusão aparc+aseg 104 (parcelas corticais) + aseg 18 (subcortical)', ids: [14, 15], classes: 104, minVox: 3e6, parts: ['aseg_18', 'aparc_aseg_104'] },
+  aparc_aseg_104: { label: 'aparc+aseg 104 classes (L/R, cerebelo, tronco, corpo caloso)', ids: [14, 15], classes: 104, minVox: 3e6 },
+  aparc_aseg_50: { label: 'aparc+aseg 50 classes (homólogos fundidos)', ids: [8, 9], classes: 50, minVox: 3e6 },
+  aseg_18: { label: 'aseg 18 classes (subcortical + tecidos)', ids: [4, 5], classes: 18, minVox: 8e6 },
+  tissue_3: { label: 'tecidos: cinzenta / branca / líquor', ids: [2, 3], classes: 3, minVox: 8e6 },
   mask: { label: 'máscara cerebral', ids: [12, 12] },
   custom: { label: 'modelo próprio', ids: [14, 15] }
 }
@@ -47,6 +51,24 @@ function download(blobOrBytes, name) {
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click()
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove() }, 2000)
+}
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+/** removeVolume do NiiVue com volume ausente remove o ÚLTIMO volume (splice(-1)); só remove se estiver carregado */
+function removeOverlay(v) { if (v && state.nv?.volumes.includes(v)) state.nv.removeVolume(v) }
+/** entradas novas são bloqueadas durante a segmentação: o resultado antigo seria atribuído ao exame novo */
+function inputBlocked() {
+  if (!state.busy) return false
+  log('Segmentação em andamento — cancele antes de abrir outro exame.')
+  return true
+}
+/** maior valor absoluto (escala para int16 sem estouro em imagens com negativos, ex. TC) */
+function absMax(a) { let m = 0; for (let i = 0; i < a.length; i++) { const v = a[i] < 0 ? -a[i] : a[i]; if (v > m && v !== Infinity) m = v } return m }
+/** tamanho do voxel pelas normas das colunas da affine (o NiiVue mantém pixDims=0 quando a sform é válida) */
+function voxSize(vol) {
+  const A = vol.hdr.affine
+  const fromAff = [0, 1, 2].map((j) => Math.hypot(A[0][j], A[1][j], A[2][j]))
+  const fromHdr = vol.hdr.pixDims.slice(1, 4).map(Math.abs)
+  return fromAff.map((v, j) => (v > 1e-6 && Number.isFinite(v) ? v : fromHdr[j] > 0 ? fromHdr[j] : 1))
 }
 const nowStamp = () => new Date().toISOString().slice(0, 19).replace('T', ' ')
 const fileStamp = () => new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')
@@ -97,16 +119,17 @@ async function showVolume(vol) {
 // ---------------------------------------------------------------- correção de movimento (antsMotionCorr-like)
 function runMotionWorker({ volumes, dims, pixdims }) {
   return new Promise((resolve, reject) => {
+    // slot próprio: não pode sobrescrever state.preWorker/rejectPending de uma segmentação em curso
     const w = new Worker(new URL('./motion-worker.js', import.meta.url), { type: 'module' })
-    state.preWorker = w
-    state.rejectPending = reject
+    state.mocoWorker = w
+    const done = () => { w.terminate(); if (state.mocoWorker === w) state.mocoWorker = null }
     w.onmessage = (e) => {
       const m = e.data
       if (m.cmd === 'progress') { log(m.message); if (m.frac != null) progress(0.05 + m.frac * 0.6) }
-      else if (m.cmd === 'error') { w.terminate(); state.preWorker = null; reject(new Error(m.message)) }
-      else if (m.cmd === 'done') { w.terminate(); state.preWorker = null; resolve(m) }
+      else if (m.cmd === 'error') { done(); reject(new Error(m.message)) }
+      else if (m.cmd === 'done') { done(); resolve(m) }
     }
-    w.onerror = (e) => { w.terminate(); state.preWorker = null; reject(new Error(e.message || 'worker de movimento falhou')) }
+    w.onerror = (e) => { done(); reject(new Error(e.message || 'worker de movimento falhou')) }
     w.postMessage({ volumes, dims, pixdims, options: { metric: 'mi' } }, volumes.map((v) => v.buffer))
   })
 }
@@ -116,7 +139,7 @@ async function motionCorrectAndOpen({ volumes, dims, pixdims, affine, name, sour
   log(`Correção de movimento: ${volumes.length} volumes (registro rígido + média)…`); progress(0.05)
   const m = await runMotionWorker({ volumes, dims, pixdims })
   const img = new Float32Array(m.img)
-  let mx = 0; for (let i = 0; i < img.length; i++) if (img[i] > mx) mx = img[i]
+  const mx = absMax(img)
   const sc = mx > 0 ? 32000 / mx : 1
   const i16 = new Int16Array(img.length)
   for (let i = 0; i < i16.length; i++) i16[i] = Math.round(img[i] * sc)
@@ -129,56 +152,70 @@ async function motionCorrectAndOpen({ volumes, dims, pixdims, affine, name, sour
 
 /** vários NIfTI 3D do mesmo protocolo → registro rígido + média */
 async function openMultiNifti(files) {
+  if (inputBlocked()) return
   try {
+    $('btnRun').disabled = true
     setStep('input', 'running')
+    $('subjectId').value = files[0].name.replace(/\.(nii|nii\.gz|mgz|mgh|nrrd)$/i, '').slice(0, 40)
     const vols = []
     for (const f of files) {
       log(`Lendo ${f.name}…`)
       vols.push(await NVImage.loadFromFile({ file: f, name: f.name }))
     }
     const d0 = vols[0].hdr.dims.slice(1, 4).join('×')
-    if (!vols.every((v) => v.hdr.dims.slice(1, 4).join('×') === d0)) {
-      log('Volumes com dimensões diferentes — abrindo apenas o primeiro (aquisições repetidas devem ter a mesma matriz).')
-      return openNiftiFile(files[0])
+    const rot = (v) => { const A = v.hdr.affine; return [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => A[r][c])) }
+    const r0 = rot(vols[0])
+    const sameGeom = (v) => v.hdr.dims.slice(1, 4).join('×') === d0 && rot(v).every((x, i) => Math.abs(x - r0[i]) <= 1e-3 * (1 + Math.abs(r0[i])))
+    if (!vols.every(sameGeom)) {
+      log('Volumes com matriz, orientação ou voxel diferentes — abrindo apenas o primeiro (aquisições repetidas devem ter a mesma geometria).')
+      return await openNiftiFile(files[0])
     }
-    if (!$('optMoco').checked) return openNiftiFile(files[0])
+    if (!$('optMoco').checked) return await openNiftiFile(files[0])
     const volumes = vols.map((v) => volumeToFloat32(v))
     await motionCorrectAndOpen({
-      volumes, dims: vols[0].hdr.dims.slice(1, 4), pixdims: vols[0].hdr.pixDims.slice(1, 4).map(Math.abs),
+      volumes, dims: vols[0].hdr.dims.slice(1, 4), pixdims: voxSize(vols[0]),
       affine: vols[0].hdr.affine.flat(), name: files[0].name,
-      source: { kind: 'nifti', nFiles: files.length, sidecar: { SeriesDescription: `média de ${files.length} aquisições registradas (moco)` } }
+      source: { kind: 'nifti', nFiles: files.length, keepSubjectId: true, sidecar: { SeriesDescription: `média de ${files.length} aquisições registradas (moco)` } }
     })
   } catch (e) {
     console.error(e); log('Falha na correção de movimento: ' + e.message); progress(0); setStep('input', 'active')
+    $('btnRun').disabled = !state.base
   }
 }
 
 // ---------------------------------------------------------------- entrada
 async function openNiftiFile(file, source = {}) {
+  if (!source.moco && inputBlocked()) return
   try {
+    $('btnRun').disabled = true
+    setStep('input', 'running')
     log(`Lendo ${file.name}…`); progress(0.2)
+    // identificador do sujeito vem do arquivo novo (antes ficava o do exame anterior e a coorte era sobrescrita)
+    if (!source.moco && !source.keepSubjectId) $('subjectId').value = file.name.replace(/\.(nii|nii\.gz|mgz|mgh|nrrd)$/i, '').slice(0, 40)
     const vol = await NVImage.loadFromFile({ file, name: file.name })
     // série 4D: corrige movimento entre volumes e segue com a média (análogo ao antsMotionCorr)
-    const nt = vol.hdr.dims[0] >= 4 ? vol.hdr.dims[4] : 1
+    const nvox3 = vol.hdr.dims[1] * vol.hdr.dims[2] * vol.hdr.dims[3]
+    const nt = vol.hdr.dims[0] >= 4 ? Math.min(vol.nFrame4D ?? vol.hdr.dims[4], Math.floor(vol.img.length / nvox3)) : 1
     if (nt > 1 && !source.moco && $('optMoco').checked) {
       const [nx, ny, nz] = vol.hdr.dims.slice(1, 4)
       const nvox = nx * ny * nz
       const all = volumeToFloat32in4D(vol, nvox, nt)
-      return motionCorrectAndOpen({
-        volumes: all, dims: [nx, ny, nz], pixdims: vol.hdr.pixDims.slice(1, 4).map(Math.abs),
+      return await motionCorrectAndOpen({
+        volumes: all, dims: [nx, ny, nz], pixdims: voxSize(vol),
         affine: vol.hdr.affine.flat(), name: file.name,
-        source: { kind: source.kind || 'nifti', nFiles: source.nFiles || 1, sidecar: { ...(source.sidecar || {}), SeriesDescription: `${source.sidecar?.SeriesDescription || file.name} — média de ${nt} volumes (moco)` } }
+        source: { ...source, kind: source.kind || 'nifti', nFiles: source.nFiles || 1, keepSubjectId: true, sidecar: { ...(source.sidecar || {}), SeriesDescription: `${source.sidecar?.SeriesDescription || file.name} — média de ${nt} volumes (moco)` } }
       })
     }
     if (!source.moco) state.motion = null
-    state.base = vol; state.conformed = null; state.labelsVol = null; state.result = null
-    state.pre = null
     resetBet()
     resetHippo()
+    state.base = vol; state.conformed = null; state.labelsVol = null; state.result = null; state.seg = null; state.meta = null
+    state.pre = null
     state.source = { kind: 'nifti', fileName: file.name, nFiles: 1, sidecar: {}, ...source }
     await showVolume(vol)
     if (!$('subjectId').value) $('subjectId').value = file.name.replace(/\.(nii|nii\.gz|mgz|mgh|nrrd)$/i, '').slice(0, 40)
     renderInputPanel()
+    stepsAfterInput()
     state.contrast = detectContrast({ sidecar: state.source.sidecar, fileName: file.name, description: vol.hdr.description || '' })
     evaluateQuality()
     setStep('input', 'done'); setStep('quality', 'active')
@@ -189,10 +226,13 @@ async function openNiftiFile(file, source = {}) {
     progress(0); log(`${file.name} carregado`)
   } catch (e) {
     console.error(e); log('Falha ao ler o arquivo: ' + e.message); progress(0)
+    setStep('input', 'active')
+    $('btnRun').disabled = !state.base
   }
 }
 
 async function openDicomFiles(files) {
+  if (inputBlocked()) return
   const list = Array.from(files).filter((f) => !/\.(nii|nii\.gz|json|txt|bvec|bval|DS_Store)$/i.test(f.name))
   if (!list.length) { log('Nenhum arquivo DICOM na seleção.'); return }
   log(`Convertendo ${list.length} arquivos DICOM com dcm2niix…`); progress(0.1)
@@ -235,6 +275,7 @@ function chooseSeries(series) {
       ul.appendChild(li)
     }
     $('seriesCancel').onclick = () => { $('seriesDlg').close(); resolve(null) }
+    $('seriesDlg').onclose = () => resolve(null) // Esc fecha o diálogo sem clicar em Cancelar (no-op após escolha)
     $('seriesDlg').showModal()
   })
 }
@@ -275,7 +316,7 @@ function renderInputPanel() {
   if (sc.Manufacturer) rows.push(['Equipamento', `${sc.Manufacturer} ${sc.ManufacturersModelName || ''}${sc.MagneticFieldStrength ? ' · ' + sc.MagneticFieldStrength + ' T' : ''}`])
   if (sc.RepetitionTime) rows.push(['TR / TE / TI', `${(sc.RepetitionTime * 1000).toFixed(0)} / ${sc.EchoTime ? (sc.EchoTime * 1000).toFixed(1) : '—'} / ${sc.InversionTime ? (sc.InversionTime * 1000).toFixed(0) : '—'} ms`])
   if (v.hdr.description) rows.push(['Descrição', v.hdr.description])
-  $('kvInput').innerHTML = rows.map(([k, val]) => `<dt>${k}</dt><dd title="${String(val).replace(/"/g, '&quot;')}">${val}</dd>`).join('')
+  $('kvInput').innerHTML = rows.map(([k, val]) => `<dt>${esc(k)}</dt><dd title="${esc(val)}">${esc(val)}</dd>`).join('')
 }
 
 // ---------------------------------------------------------------- qualidade
@@ -337,7 +378,7 @@ function runPreprocess(vol, { allowResample = true, allowBias = true } = {}) {
     state.preWorker = w
     state.rejectPending = reject
     const img = volumeToFloat32(vol)
-    const dims = vol.hdr.dims.slice(1, 4), pixdims = vol.hdr.pixDims.slice(1, 4).map(Math.abs), affine = vol.hdr.affine.flat()
+    const dims = vol.hdr.dims.slice(1, 4), pixdims = voxSize(vol), affine = vol.hdr.affine.flat()
     const options = {
       targetMM: 1.0, biasCorrect: $('optBias').checked && allowBias, biasMethod: $('biasMethodSel').value,
       denoise: $('optDenoise').checked && allowResample,
@@ -347,12 +388,12 @@ function runPreprocess(vol, { allowResample = true, allowBias = true } = {}) {
     w.onmessage = async (e) => {
       const m = e.data
       if (m.cmd === 'progress') { log(m.message); progress(0.05 + m.frac * 0.2) }
-      else if (m.cmd === 'error') { w.terminate(); reject(new Error(m.message)) }
-      else if (m.cmd === 'done') {
-        w.terminate(); state.preWorker = null
+      else if (m.cmd === 'error') { w.terminate(); if (state.preWorker === w) state.preWorker = null; reject(new Error(m.message)) }
+      else if (m.cmd === 'done') try {
+        w.terminate(); if (state.preWorker === w) state.preWorker = null
         state.robustLog = m.log
-        // normaliza para int16 para não explodir memória
-        let mx = 0; for (let i = 0; i < m.img.length; i++) if (m.img[i] > mx) mx = m.img[i]
+        // normaliza para int16 para não explodir memória (escala pelo |máx| — negativos de TC não estouram)
+        const mx = absMax(m.img)
         const sc = mx > 0 ? 32000 / mx : 1
         const i16 = new Int16Array(m.img.length)
         for (let i = 0; i < i16.length; i++) i16[i] = Math.round(m.img[i] * sc)
@@ -361,16 +402,17 @@ function runPreprocess(vol, { allowResample = true, allowBias = true } = {}) {
         state.pre = { buf, prov: m.prov || {}, log: m.log }
         const nvi = await NVImage.new(buf.slice(0), 'preprocessado.nii')
         resolve(nvi)
-      }
+      } catch (err) { reject(err) }
     }
-    w.onerror = (e) => { w.terminate(); reject(new Error(e.message || 'worker de pré-processamento falhou')) }
+    w.onerror = (e) => { w.terminate(); if (state.preWorker === w) state.preWorker = null; reject(new Error(e.message || 'worker de pré-processamento falhou')) }
     w.postMessage({ img, dims, pixdims, affine, options }, [img.buffer])
   })
 }
 
-function currentModelEntry() {
-  const key = $('modelSel').value
-  const low = $('lowMem').checked
+function currentModelEntry(lowOverride) {
+  return modelEntryFor($('modelSel').value, lowOverride ?? $('lowMem').checked)
+}
+function modelEntryFor(key, low) {
   const def = MODELS[key]
   const entry = JSON.parse(JSON.stringify(inferenceModelsList[def.ids[low ? 1 : 0] - 1]))
   entry.isScalar = false
@@ -378,10 +420,85 @@ function currentModelEntry() {
   if (key === 'custom') {
     const murl = $('customModelUrl').value.trim(), lurl = $('customLabelsUrl').value.trim()
     if (!murl) throw new Error('Informe a URL do model.json do modelo próprio.')
-    entry.path = murl; entry.labelsPath = lurl || null; entry.colormapPath = null; entry.preModelId = null; entry.modelName = 'custom'
-    entry._absolute = true
+    // o worker só concatena rootURL em caminhos não absolutos; resolvemos aqui relativo à página
+    entry.path = new URL(murl, location.href).href
+    entry.labelsPath = lurl ? new URL(lurl, location.href).href : null
+    entry.colormapPath = null; entry.preModelId = null; entry.modelName = 'custom'
   }
-  return { key, entry, label: def.label }
+  return { key, entry, label: def.label, lowMem: low }
+}
+
+/**
+ * O modo "alta memória" guarda a saída final (voxels do recorte × classes, 1 valor por texel) numa
+ * única textura; se isso excede MAX_TEXTURE_SIZE² a tentativa falha com certeza — só depois de minutos
+ * de convolução. Nesses casos começamos direto no modo baixa memória (convolução sequencial por classe).
+ */
+function mustUseLowMem(modelSel, backend) {
+  const def = MODELS[modelSel.key]
+  if (modelSel.lowMem || backend !== 'webgl' || !def?.classes) return false
+  let maxTex = 0
+  try { maxTex = state.nv.gl.getParameter(state.nv.gl.MAX_TEXTURE_SIZE) } catch { return false }
+  if (!maxTex) return false
+  return def.classes * def.minVox > maxTex * maxTex
+}
+
+// erros de recurso (GPU/memória/shader) justificam tentar uma configuração mais modesta
+const isResourceError = (msg) => /texture|memory|mem[oó]ria|webgl|shader|context|gpu|alloc|buffer|compile|out of|oom/i.test(msg || '')
+
+/**
+ * Inferência com recuo automático: configuração escolhida → baixa memória → CPU.
+ * Em GPUs integradas o limite de textura (8192) derruba os modelos "alta memória"; antes o usuário
+ * precisava descobrir sozinho a caixa "Baixa memória".
+ */
+async function inferWithFallback(conf, modelSel, opts, infImg) {
+  const attempts = [{ sel: modelSel, backend: opts.backend }]
+  if (!modelSel.lowMem && modelSel.key !== 'custom') attempts.push({ sel: modelEntryFor(modelSel.key, true), backend: opts.backend })
+  if (opts.backend !== 'cpu') attempts.push({ sel: modelSel.key === 'custom' ? modelSel : modelEntryFor(modelSel.key, true), backend: 'cpu' })
+  for (let a = 0; a < attempts.length; a++) {
+    const at = attempts[a]
+    try {
+      const labels = await runInference(conf, at.sel, { ...opts, backend: at.backend }, infImg)
+      return { labels, backend: at.backend, lowMem: at.sel.lowMem, fallbacks: a }
+    } catch (e) {
+      if (state.cancelled || e.message === 'cancelado') throw e
+      const next = attempts[a + 1]
+      if (!next || !isResourceError(e.message)) throw e
+      const desc = (x) => `${x.backend === 'cpu' ? 'CPU' : 'WebGL'}${x.sel.lowMem ? ' · baixa memória' : ''}`
+      log(`${desc(at)} falhou (${e.message.slice(0, 90)}). Tentando ${desc(next)}…`)
+      console.warn('[inferência] recuo:', e.message)
+    }
+  }
+}
+
+// ---------------------------------------------------------------- conformação em worker
+// ?conform=robust usa a janela de exibição do NiiVue (brain2print); o padrão é a regra do
+// FreeSurfer/FastSurfer (mín → p99,9 dos não nulos), a mesma do app brainchop de onde vêm os modelos.
+const CONFORM_ROBUST = new URLSearchParams(location.search).get('conform') === 'robust'
+
+function conformInWorker(vol) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./conform-worker.js', import.meta.url), { type: 'module' })
+    state.preWorker = w
+    state.rejectPending = reject
+    w.onmessage = async (e) => {
+      const m = e.data
+      w.terminate(); if (state.preWorker === w) state.preWorker = null
+      if (m.cmd === 'error') { reject(new Error(m.message)); return }
+      try {
+        const buf = writeNifti({ dims: [256, 256, 256], pixdims: [1, 1, 1], affine: m.affine, dtype: 'uint8', data: new Uint8Array(m.img), description: 'Morfo conformado 256 1mm' })
+        resolve(await NVImage.new(buf, 'conformado.nii'))
+      } catch (err) { reject(err) }
+    }
+    w.onerror = (e) => { w.terminate(); if (state.preWorker === w) state.preWorker = null; reject(new Error(e.message || 'worker de conformação falhou')) }
+    const h = vol.hdr
+    const okSlope = Number.isFinite(h.scl_slope) && h.scl_slope !== 0
+    w.postMessage({
+      img: vol.img, dims: Array.from(h.dims), affine: h.affine.flat(),
+      sclSlope: okSlope ? h.scl_slope : 1, sclInter: okSlope && Number.isFinite(h.scl_inter) ? h.scl_inter : 0,
+      globalMin: vol.global_min, globalMax: vol.global_max, calMin: vol.cal_min, calMax: vol.cal_max,
+      datatypeCode: h.datatypeCode, robust: CONFORM_ROBUST, toRAS: false, isLinear: true
+    })
+  })
 }
 
 async function fetchJSON(url) { const r = await fetch(url); if (!r.ok) throw new Error(`${url}: ${r.status}`); return r.json() }
@@ -401,13 +518,27 @@ function runInference(conf, modelSel, opts, imgOverride) {
     w.onmessage = (e) => {
       const m = e.data
       if (m.cmd === 'ui') {
-        if (m.message) log(m.message)
+        if (m.message && !/^unreliable reasons/.test(m.message)) log(m.message) // no CPU chega a cada camada
         if (typeof m.progressFrac === 'number' && m.progressFrac >= 0) progress(0.3 + m.progressFrac * 0.65)
-        if (m.modalMessage) { w.terminate(); state.worker = null; reject(new Error(m.modalMessage)) }
-      } else if (m.cmd === 'img') { w.terminate(); state.worker = null; resolve(new Uint8Array(m.img)) }
+        // modais do brainchop são avisos (ex.: memória "unreliable" no CPU); a falha real chega como 'fatal'
+        if (m.modalMessage) console.warn('[inferência]', m.modalMessage)
+      } else if (m.cmd === 'fatal') { w.terminate(); state.worker = null; reject(new Error(m.message)) }
+      else if (m.cmd === 'img') { w.terminate(); state.worker = null; resolve(m.img instanceof Uint8Array ? m.img : Uint8Array.from(m.img)) }
     }
     w.onerror = (e) => { w.terminate(); state.worker = null; reject(new Error(e.message || 'worker de inferência falhou')) }
     w.postMessage({ opts, modelEntry: modelSel.entry, niftiHeader: { datatypeCode: conf.hdr.datatypeCode, dims: conf.hdr.dims }, niftiImage: imgOverride || conf.img })
+  })
+}
+
+function runFusionWorker(p) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./fusion-worker.js', import.meta.url), { type: 'module' })
+    state.preWorker = w
+    state.rejectPending = reject
+    const end = () => { w.terminate(); if (state.preWorker === w) state.preWorker = null }
+    w.onmessage = (e) => { end(); if (e.data.cmd === 'done') resolve(e.data); else reject(new Error(e.data.message)) }
+    w.onerror = (e) => { end(); reject(new Error(e.message || 'worker de fusão falhou')) }
+    w.postMessage(p, [p.aseg.buffer, p.aparc.buffer])
   })
 }
 
@@ -436,7 +567,7 @@ function mockBrainProb(conf) {
 }
 
 function resetBet() {
-  if (state.bet?.overlay && state.nv) { try { state.nv.removeVolume(state.bet.overlay) } catch { /* já removido */ } }
+  removeOverlay(state.bet?.overlay)
   state.bet = null
 }
 
@@ -453,11 +584,18 @@ async function runBrainExtraction(conf, opts) {
     maskEntry.isScalar = true // devolve softmax de "cérebro" (0–255) em vez do argmax
     maskEntry.type = 'Segmentation' // evita a binarização do caminho Brain_Masking
     maskEntry.isNvidia = /nvidia/i.test(state.gpuRenderer)
-    prob = await runInference(conf, { entry: maskEntry, key: 'mask-prob' }, opts)
+    try {
+      prob = await runInference(conf, { entry: maskEntry, key: 'mask-prob' }, opts)
+    } catch (e) {
+      if (state.cancelled || opts.backend === 'cpu' || !isResourceError(e.message)) throw e
+      log(`Máscara em WebGL falhou (${e.message.slice(0, 80)}); tentando CPU…`)
+      prob = await runInference(conf, { entry: maskEntry, key: 'mask-prob' }, { ...opts, backend: 'cpu' })
+    }
   }
   if (state.cancelled) throw new Error('cancelado')
   const f = Math.max(0.1, Math.min(0.9, Number($('fBet').value) || 0.5))
   const m = await runMaskWorker({ prob, intensity: conf.img, dims: [256, 256, 256], f, normalize: $('optNorm').checked })
+  if (!m.voxels) throw new Error(`Máscara cerebral vazia com f=${f} — reduza o limiar f.`)
   state.bet = { mask: new Uint8Array(m.mask), brain: new Uint8Array(m.brain), f, voxels: m.voxels, normalized: !!m.normalized, cleanupLog: m.log }
   // QC: sobrepõe a máscara no visualizador (controlada pelo slider de opacidade)
   const overlay = conf.clone()
@@ -475,19 +613,18 @@ async function runBrainExtraction(conf, opts) {
   return state.bet
 }
 
-async function finishSegmentation({ conf, labels, modelSel, backend, t0 }) {
+async function finishSegmentation({ conf, labels, modelSel, backend, t0, labelNames = null, colormap = null, result: givenResult = null, extraMeta = null }) {
   const nv = state.nv
-  // ---- rótulos e cores
-  let labelNames = null, colormap = null
-  if (modelSel.entry.labelsPath) labelNames = await fetchJSON(modelSel.entry.labelsPath)
-  if (modelSel.entry.colormapPath) colormap = await fetchJSON(modelSel.entry.colormapPath)
+  // ---- rótulos e cores (segmentações importadas já chegam com nomes/cores do LUT do FreeSurfer)
+  if (!labelNames && modelSel.entry.labelsPath) labelNames = await fetchJSON(modelSel.entry.labelsPath)
+  if (!colormap && modelSel.entry.colormapPath) colormap = await fetchJSON(modelSel.entry.colormapPath)
   if (!labelNames) labelNames = { 0: 'BG', 1: 'Brain' }
   if (!colormap) {
     const n = Math.max(...Object.keys(labelNames).map(Number)) + 1
     colormap = { R: new Array(n).fill(0), G: new Array(n).fill(0), B: new Array(n).fill(0) }
     for (let i = 1; i < n; i++) { const h = (i * 137.508) % 360; const [r, g, b] = hsl(h, 0.65, 0.55); colormap.R[i] = r; colormap.G[i] = g; colormap.B[i] = b }
   }
-  if (!colormap.labels) colormap.labels = Object.keys(labelNames).sort((a, b) => a - b).map((k) => labelNames[k])
+  if (!colormap.labels) colormap.labels = Array.from({ length: colormap.R.length }, (_, i) => labelNames[i] ?? '')
   state.labelNames = labelNames; state.colormap = colormap; state.modelKey = modelSel.key; state.modelEntry = modelSel.entry
   // ---- sobreposição
   const overlay = conf.clone()
@@ -504,7 +641,7 @@ async function finishSegmentation({ conf, labels, modelSel, backend, t0 }) {
   // ---- estatísticas
   setStep('segment', 'done'); setStep('stats', 'running'); log('Calculando estatísticas…'); progress(0.97)
   await new Promise((r) => setTimeout(r, 30))
-  const result = computeStats({ labels, intensity: conf.img, dims: [256, 256, 256], affine: conf.hdr.affine.flat(), voxelVolume: 1, labelNames, colormap })
+  const result = givenResult || computeStats({ labels, intensity: conf.img, dims: [256, 256, 256], affine: conf.hdr.affine.flat(), voxelVolume: 1, labelNames, colormap })
   state.result = result
   const q = state.quality
   state.meta = {
@@ -515,6 +652,7 @@ async function finishSegmentation({ conf, labels, modelSel, backend, t0 }) {
     motion: state.motion ? { nVolumes: state.motion.nVolumes, meanDisplacement: state.motion.meanDisplacement, params: state.motion.params } : null,
     // proveniência: quais etapas de pré-processamento rodaram e com quais parâmetros
     preproc: {
+      conform: { grid: '256³ 1 mm LIA', intensity: CONFORM_ROBUST ? 'janela robusta NiiVue (cal_min/cal_max)' : 'FreeSurfer/FastSurfer: mín → p99,9 dos não nulos', worker: true },
       motionCorrection: state.motion ? { applied: true, nVolumes: state.motion.nVolumes, meanDisplacement_mm: state.motion.meanDisplacement } : { applied: false },
       reorientRAS: state.pre?.prov?.reorient || { applied: false },
       neckCrop: state.pre?.prov?.neckCrop || { applied: false },
@@ -523,7 +661,8 @@ async function finishSegmentation({ conf, labels, modelSel, backend, t0 }) {
         ? { applied: true, f: state.bet.f, mask_cm3: state.bet.voxels / 1000, normalizedWithinMask: state.bet.normalized, cleanup: state.bet.cleanupLog }
         : { applied: false }
     },
-    backend, elapsedS: ((performance.now() - t0) / 1000).toFixed(1), processedAt: nowStamp(), app: `Morfo Studio ${VERSION}`
+    backend, elapsedS: ((performance.now() - t0) / 1000).toFixed(1), processedAt: nowStamp(), app: `Morfo Studio ${VERSION}`,
+    ...(extraMeta || {})
   }
   renderStats()
   setStep('stats', 'done'); setStep('export', 'active')
@@ -539,11 +678,77 @@ async function finishSegmentation({ conf, labels, modelSel, backend, t0 }) {
   progress(0); log(`Segmentação concluída em ${state.meta.elapsedS} s — ${result.regions.length} regiões`)
 }
 
+// ---------------------------------------------------------------- importação de segmentação externa
+function runImportWorker(p) {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./seg-import-worker.js', import.meta.url), { type: 'module' })
+    state.preWorker = w
+    state.rejectPending = reject
+    const fin = () => { w.terminate(); if (state.preWorker === w) state.preWorker = null }
+    w.onmessage = (e) => {
+      const m = e.data
+      if (m.cmd === 'progress') { log(m.message); progress(0.6 + 0.35 * (m.frac || 0)) }
+      else if (m.cmd === 'error') { fin(); reject(new Error(m.message)) }
+      else if (m.cmd === 'done') { fin(); resolve(m) }
+    }
+    w.onerror = (e) => { fin(); reject(new Error(e.message || 'importação falhou')) }
+    w.postMessage(p)
+  })
+}
+
+/**
+ * Importa aseg/aparc+aseg/aparc.DKTatlas+aseg (FreeSurfer, FastSurfer) ou a saída do SynthSeg.
+ * Volumes são contados na GRADE NATIVA da segmentação (contagem × volume do voxel pela affine), como
+ * o FreeSurfer; a cópia reamostrada na grade conformada do T1 serve à visualização e ao hipocampo.
+ * Todo o processamento pesado roda em workers (conformação e remapeamento/estatísticas).
+ */
+async function importSegmentation(file) {
+  if (inputBlocked()) return
+  if (!state.base) { log('Abra primeiro o T1 do mesmo exame (ou o orig.mgz/T1.mgz do FreeSurfer) e depois importe a segmentação.'); return }
+  const t0 = performance.now()
+  state.cancelled = false
+  setBusy(true)
+  const runBase = state.base
+  try {
+    log(`Lendo segmentação ${file.name}…`); progress(0.1)
+    const seg = await NVImage.loadFromFile({ file, name: file.name })
+    const h = seg.hdr
+    const dims = h.dims.slice(1, 4)
+    const slope = Number.isFinite(h.scl_slope) && h.scl_slope !== 0 ? h.scl_slope : 1
+    const inter = Number.isFinite(h.scl_inter) ? h.scl_inter : 0
+    resetBet(); resetHippo()
+    state.seg = null; state.labelsVol = null; state.result = null; state.pre = null; state.robustLog = []
+    log('Conformando o T1 (grade de visualização)…'); progress(0.3)
+    const conf = await conformInWorker(state.base)
+    if (state.cancelled || state.base !== runBase) throw new Error('cancelado')
+    state.conformed = conf
+    await showVolume(conf)
+    $('layoutSel').onchange({ target: $('layoutSel') })
+    const m = await runImportWorker({ img: seg.img, slope, inter, dims, affine: h.affine.flat(), confAffine: conf.hdr.affine.flat() })
+    if (state.cancelled || state.base !== runBase) throw new Error('cancelado')
+    const modelSel = { key: 'importado', label: `segmentação importada (${file.name})`, entry: { path: file.name }, lowMem: false }
+    await finishSegmentation({
+      conf, labels: new Uint8Array(m.confLabels), modelSel, backend: 'importado', t0,
+      labelNames: m.labelNames, colormap: m.colormap, result: m.result,
+      extraMeta: {
+        pipeline: 'importado',
+        imported: { file: file.name, labels: m.codes.length, unknownLabels: m.unknown, nativeDims: dims, voxel_mm3: m.voxelVolume, note: 'volumes contados na grade nativa da segmentação; sobreposição reamostrada (vizinho mais próximo) na grade conformada do T1' }
+      }
+    })
+    log(`Segmentação importada: ${m.codes.length} rótulos${m.unknown ? ` (${m.unknown} fora do LUT)` : ''}, volumes na grade nativa ${dims.join('×')} (${m.voxelVolume.toFixed(3)} mm³/voxel)`)
+  } catch (e) {
+    progress(0)
+    if (e.message === 'cancelado') log('Importação cancelada.')
+    else { console.error(e); log('Falha ao importar a segmentação: ' + e.message) }
+  } finally {
+    state.rejectPending = null
+    setBusy(false)
+  }
+}
+
 // ---------------------------------------------------------------- hipocampo
 function resetHippo() {
-  if (state.hippo?.overlay && state.nv) {
-    try { state.nv.removeVolume(state.hippo.overlay) } catch { /* já removido junto com o volume base */ }
-  }
+  removeOverlay(state.hippo?.overlay)
   state.hippo = null
   $('btnHippo').disabled = true
   for (const b of document.querySelectorAll('#panelHippo [data-export]')) b.disabled = true
@@ -567,7 +772,7 @@ async function runHippoAnalysis() {
     if (state.conformed !== conf || state.seg !== seg) return // nova segmentação começou no meio; descarta
     result.elapsed_s = ((performance.now() - t0) / 1000).toFixed(1)
     // sobreposição própria (acima da segmentação de cérebro inteiro)
-    if (state.hippo?.overlay) { try { await state.nv.removeVolume(state.hippo.overlay) } catch { /* ignore */ } }
+    removeOverlay(state.hippo?.overlay)
     const overlay = buildHippoOverlay(state.conformed, labelsOut, Number($('opacity').value) || 0.85)
     await state.nv.addVolume(overlay)
     state.hippo = { result, labels: labelsOut, overlay }
@@ -579,7 +784,7 @@ async function runHippoAnalysis() {
     progress(0); log('Análise hipocampal falhou: ' + e.message)
     $('hippoBody').innerHTML = `<p class="empty">Falha: ${e.message}</p>`
   } finally {
-    btn.disabled = false
+    btn.disabled = !(state.seg && !state.busy && hasHippocampus(state.labelNames))
   }
 }
 
@@ -620,6 +825,8 @@ function setBusy(on) {
   b.textContent = on ? 'Cancelar' : 'Segmentar'
   b.classList.toggle('primary', !on)
   b.disabled = false
+  for (const id of ['btnDicom', 'btnNifti', 'btnDemo', 'btnImportSeg']) $(id).disabled = on
+  if (on) $('btnHippo').disabled = true
 }
 
 async function runSegmentation() {
@@ -632,12 +839,19 @@ async function runSegmentation() {
   const t0 = performance.now()
   setStep('quality', 'done'); setStep('segment', 'running'); setStep('stats', null); setStep('export', null)
   setExportsEnabled(false)
+  // se o exame de base mudar no meio (ou o usuário cancelar), a execução é abandonada
+  const runBase = state.base
+  const alive = () => { if (state.cancelled || state.base !== runBase) throw new Error('cancelado') }
   try {
     const nv = state.nv
     let vol = state.base
     state.robustLog = []
     state.pre = null
     resetBet()
+    // resultados anteriores ficam inválidos: evita hipocampo/exportações com rótulos antigos sobre o volume novo
+    resetHippo()
+    state.seg = null; state.labelsVol = null; state.result = null
+    $('opacityBox').hidden = true
     // pré-processamento nativo: sempre que qualquer etapa estiver ligada
     // (reorientação/recorte/viés no padrão; no robusto inclui reamostragem)
     const needsPre = state.pipeline === 'robusto' || $('optReorient').checked || $('optCrop').checked || ($('optBias').checked && $('optBiasStd').checked)
@@ -648,33 +862,59 @@ async function runSegmentation() {
         allowBias: state.pipeline === 'robusto' || $('optBiasStd').checked
       })
     }
-    if (state.cancelled) throw new Error('cancelado')
+    alive()
     log('Conformando para 256³ a 1 mm…'); progress(0.28)
-    const conf = await nv.conform(vol, false, true, false, true)
+    const conf = await conformInWorker(vol)
+    alive()
     state.conformed = conf
     await showVolume(conf)
-    nv.setSliceType(nv.sliceTypeMultiplanar)
+    $('layoutSel').onchange({ target: $('layoutSel') }) // mantém a disposição escolhida pelo usuário
     // ---- inferência
     const opts = { ...brainChopOpts }
-    opts.rootURL = new URL('.', location.href).href.replace(/\/$/, '')
+    opts.rootURL = new URL('..', import.meta.url).href.replace(/\/$/, '') // raiz do app (js/..), independe da URL da página
     opts.backend = $('backendSel').value
     opts.telemetryFlag = false
     // ---- extração cerebral (≈ BET) antes da segmentação, sobre o volume conformado já corrigido
     let infImg = null
     if ($('optBet').checked && modelSel.key !== 'mask') {
       await runBrainExtraction(conf, opts)
-      if (state.cancelled) throw new Error('cancelado')
+      alive()
       infImg = state.bet.brain
       progress(0.3)
     }
-    const labels = new URLSearchParams(location.search).has('mock') ? await mockLabels(conf, modelSel.entry, infImg) : await runInference(conf, modelSel, opts, infImg)
-    if (state.cancelled) throw new Error('cancelado')
-    await finishSegmentation({ conf, labels, modelSel, backend: opts.backend, t0 })
+    const mock = new URLSearchParams(location.search).has('mock')
+    // uma rede (ou, na fusão, as duas em sequência); cada uma escolhe baixa memória se não couber na GPU
+    const parts = MODELS[modelSel.key]?.parts ? MODELS[modelSel.key].parts.map((k) => modelEntryFor(k, modelSel.lowMem)) : [modelSel]
+    const outs = {}, used = []
+    for (let p = 0; p < parts.length; p++) {
+      let sel = parts[p]
+      if (mustUseLowMem(sel, opts.backend)) {
+        sel = modelEntryFor(sel.key, true)
+        log(`GPU com textura máxima ${state.nv.gl.getParameter(state.nv.gl.MAX_TEXTURE_SIZE)} px: a saída de ${sel.key} não cabe no modo alta memória — usando baixa memória.`)
+      }
+      if (parts.length > 1) log(`Rede ${p + 1}/${parts.length}: ${sel.label}…`)
+      if (mock) { outs[sel.key] = await mockLabels(conf, sel.entry, infImg); used.push(`${opts.backend} (mock)`) } else {
+        const r = await inferWithFallback(conf, sel, opts, infImg)
+        outs[sel.key] = r.labels
+        used.push(`${r.backend}${r.lowMem ? ' (baixa memória)' : ''}${r.fallbacks ? ' — recuo automático' : ''}`)
+      }
+      alive()
+    }
+    let labels, extraMeta = null
+    if (parts.length > 1) {
+      log('Fundindo: subcortical do aseg 18 + parcelas corticais do aparc+aseg 104…')
+      const [names18, names104] = await Promise.all([fetchJSON(parts[0].entry.labelsPath), fetchJSON(parts[1].entry.labelsPath)])
+      const f = await runFusionWorker({ aseg: outs.aseg_18, aparc: outs.aparc_aseg_104, names18, names104 })
+      labels = f.labels
+      extraMeta = { fusion: { models: parts.map((x) => x.entry.path), method: 'anatomia do aseg 18 (lado pelos rótulos L/R do 104) + CC/LCR do 104 + fita cortical do aseg 18 com parcelas DK do 104 (propagação geodésica)', ...f.stats } }
+    } else labels = outs[parts[0].key]
+    alive()
+    await finishSegmentation({ conf, labels, modelSel, backend: [...new Set(used)].join(' + '), t0, extraMeta })
   } catch (e) {
-    setStep('segment', 'active')
+    setStep('segment', 'active'); setStep('stats', null); setStep('export', null)
     progress(0)
     if (e.message === 'cancelado') log('Segmentação cancelada.')
-    else { console.error(e); log('Erro: ' + e.message + (/memory|texture|WebGL/i.test(e.message) ? ' — tente "Baixa memória" ou backend CPU.' : '')) }
+    else { console.error(e); log('Erro: ' + e.message + (isResourceError(e.message) ? ' — recursos insuficientes mesmo no modo CPU; feche outras abas ou use um modelo menor.' : '')) }
   } finally {
     state.rejectPending = null
     setBusy(false)
@@ -787,7 +1027,13 @@ async function brainNiftiGz() {
   const buf = writeNifti({ dims: [256, 256, 256], pixdims: [1, 1, 1], affine: c.hdr.affine.flat(), dtype: 'uint8', data: state.bet.brain, description: 'Morfo cerebro extraido' })
   return gzipBlob(buf)
 }
+function syncMetaIds() {
+  if (!state.meta) return
+  state.meta.subjectId = $('subjectId').value.trim() || state.meta.subjectId
+  state.meta.session = $('sessionId').value.trim()
+}
 async function doExport(kind) {
+  syncMetaIds()
   const base = `${state.meta?.subjectId || 'morfo'}_${state.modelKey || ''}_${fileStamp()}`
   try {
     switch (kind) {
@@ -851,8 +1097,11 @@ function renderCohort() {
 }
 function addToCohort() {
   if (!state.result) return
+  syncMetaIds()
   const row = wideRow()
   const idx = state.cohort.findIndex((c) => c.row.subject_id === row.subject_id && c.row.session === row.session && c.row.model === row.model)
+  if (idx >= 0 && state.cohort[idx].row.acquisition !== row.acquisition &&
+      !confirm(`${row.subject_id} já está na coorte com outra aquisição (${state.cohort[idx].row.acquisition}). Substituir?`)) return
   if (idx >= 0) state.cohort[idx] = { row }; else state.cohort.push({ row })
   saveCohort(); renderCohort()
   log(`${row.subject_id} ${idx >= 0 ? 'atualizado na' : 'adicionado à'} coorte (${state.cohort.length})`)
@@ -860,6 +1109,7 @@ function addToCohort() {
 
 // ---------------------------------------------------------------- exemplo sintético
 async function loadDemo() {
+  if (inputBlocked()) return
   const nx = 192, ny = 192, nz = 40, pix = [1.2, 1.2, 4.0]
   const img = new Int16Array(nx * ny * nz)
   const cx = 96, cy = 96, cz = 20
@@ -880,7 +1130,7 @@ async function loadDemo() {
   const buf = writeNifti({ dims: [nx, ny, nz], pixdims: pix, affine, dtype: 'int16', data: img, description: 'Morfo demo sintetico T1-like' })
   const file = new File([buf], 'exemplo_sintetico_T1_4mm.nii')
   $('subjectId').value = 'demo-sintetico'
-  await openNiftiFile(file, { kind: 'nifti', sidecar: { SeriesDescription: 'sintético T1-like axial 4 mm (não é um cérebro real)' } })
+  await openNiftiFile(file, { kind: 'nifti', keepSubjectId: true, sidecar: { SeriesDescription: 'sintético T1-like axial 4 mm (não é um cérebro real)' } })
 }
 
 // ---------------------------------------------------------------- ligações
@@ -895,6 +1145,8 @@ function bind() {
     e.target.value = ''
   }
   $('btnDemo').onclick = loadDemo
+  $('btnImportSeg').onclick = () => $('inSeg').click()
+  $('inSeg').onchange = (e) => { if (e.target.files[0]) importSegmentation(e.target.files[0]); e.target.value = '' }
   $('btnRun').onclick = runSegmentation
   $('btnHippo').onclick = runHippoAnalysis
   $('modelSel').onchange = () => { $('customModelField').hidden = $('modelSel').value !== 'custom' }
@@ -917,6 +1169,7 @@ function bind() {
   view.addEventListener('dragleave', () => view.classList.remove('dragover'))
   view.addEventListener('drop', async (e) => {
     e.preventDefault(); view.classList.remove('dragover')
+    if (inputBlocked()) return
     const files = await readDropped(e.dataTransfer)
     if (!files.length) return
     const niis = files.filter((f) => /\.(nii|nii\.gz|mgz|mgh|nrrd)$/i.test(f.name))
@@ -929,9 +1182,27 @@ function bind() {
   const net = () => { $('dotNet').className = 'dot ' + (navigator.onLine ? 'ok' : 'warn'); $('netText').textContent = navigator.onLine ? 'online' : 'offline (ok)' }
   window.addEventListener('online', net); window.addEventListener('offline', net); net()
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+    const hadController = !!navigator.serviceWorker.controller // 1ª visita: clients.claim não deve recarregar
     navigator.serviceWorker.register('sw.js').then((reg) => {
       $('dotSw').className = 'dot ok'; $('swText').textContent = 'cache offline'
-      reg.addEventListener('updatefound', () => { $('swText').textContent = 'atualizando…'; const nw = reg.installing; nw && nw.addEventListener('statechange', () => { if (nw.state === 'activated' || nw.state === 'installed') $('swText').textContent = 'cache offline' }) })
+      // versão nova instalada em espera: oferece recarregar (a aba atual segue coerente na versão antiga)
+      const offerUpdate = (w) => {
+        if (!w || !navigator.serviceWorker.controller) return
+        $('dotSw').className = 'dot warn'; $('swText').textContent = 'atualização pronta — clique'
+        $('swText').parentElement.style.cursor = 'pointer'
+        $('swText').parentElement.onclick = () => {
+          if (state.busy) { log('Aguarde o fim da segmentação para atualizar.'); return }
+          w.postMessage({ type: 'SKIP_WAITING' })
+        }
+      }
+      if (reg.waiting) offerUpdate(reg.waiting)
+      reg.addEventListener('updatefound', () => {
+        const nw = reg.installing
+        $('swText').textContent = 'baixando atualização…'
+        nw && nw.addEventListener('statechange', () => { if (nw.state === 'installed') offerUpdate(nw) })
+      })
+      let reloading = false
+      navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController && !reloading) { reloading = true; location.reload() } })
     }).catch(() => { $('dotSw').className = 'dot warn'; $('swText').textContent = 'sem cache' })
   } else { $('dotSw').className = 'dot warn'; $('swText').textContent = 'sem cache (file://)' }
 }
@@ -942,7 +1213,6 @@ function bind() {
     await initViewer()
     bind()
     loadCohort()
-    window.morfo = { openDicomFiles, openNiftiFile, state } // acesso programático / testes
     // API para scripts/console: window.morfo.state, openNiftiFile(File), runSegmentation(), finishSegmentation({conf, labels, modelSel, backend, t0}), doExport(kind)
     window.morfo = { state, openNiftiFile, openDicomFiles, runSegmentation, cancelSegmentation, finishSegmentation, currentModelEntry, doExport, addToCohort, computeStats, runHippoAnalysis, VERSION }
     log('pronto — abra uma pasta DICOM ou um NIfTI')

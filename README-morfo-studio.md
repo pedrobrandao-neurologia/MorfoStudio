@@ -9,7 +9,10 @@ Arquitetura inspirada no [brain2print](https://github.com/niivue/brain2print) e 
 | DICOM → NIfTI | `dcm2niix` em WebAssembly (`@niivue/dcm2niix`), com seleção de série e leitura do sidecar JSON |
 | Régua de qualidade | `js/quality.js` — classifica o exame em A–D (voxel, anisotropia, nº de cortes, FOV, contraste, campo) e escolhe o ramo do pipeline |
 | Pré-processamento | `js/preprocess-worker.js` + `js/fsl-prep.js` + `js/n4.js` + `js/motion-worker.js` + `js/mask-worker.js` — reorientação RAS (≈ `fslreorient2std`), recorte de pescoço (≈ `robustfov`), viés **N4 (ANTs-like)** ou homomórfico, movimento entre volumes (≈ `antsMotionCorr`), extração cerebral com limiar f (≈ `BET`), normalização na máscara (≈ `FAST -B`), reamostragem cúbica; ver seções abaixo |
-| Segmentação | `js/brainchop-webworker.js` (MIT, brainchop) com modelos `aseg 18`, `aparc+aseg 50`, `aparc+aseg 104`, tecidos e máscara; backend WebGL ou CPU; modo baixa memória |
+| Conformação | `js/conform-worker.js` — porte fiel do `conform()` do NiiVue (256³, 1 mm, LIA, uint8; escala do FastSurfer mín → p99,9) fora da thread principal; saída idêntica byte a byte à do NiiVue |
+| Segmentação | `js/brainchop-webworker.js` (MIT, brainchop) com modelos `aseg 18`, `aparc+aseg 50`, `aparc+aseg 104`, tecidos e máscara; backend WebGL ou CPU; modo baixa memória escolhido sozinho quando a saída não cabe na textura da GPU; recuo automático alta memória → baixa memória → CPU |
+| Fusão (padrão) | `js/fusion.js` + `js/fusion-worker.js` — subcortical, ventrículos, cerebelo e fita cortical do `aseg 18` + parcelas corticais Desikan–Killiany e corpo caloso do `aparc+aseg 104`; ver *Precisão medida* |
+| Importação | `js/seg-import-worker.js` + `js/fs-lut.js` — importa `aparc+aseg`/`aseg` do FreeSurfer, FastSurfer ou SynthSeg (`.mgz`/`.nii`), com nomes e cores do `FreeSurferColorLUT` e volumes na grade nativa |
 | Estatísticas | `js/stats.js` — volume, %, intensidade, centroide RAS, hemisférios (rótulos L/R ou linha média), lobos de Desikan, cerebelo, tronco, ventrículos, corpo caloso, índice de assimetria |
 | Hipocampo | `js/hippocampus.js` + `js/hippocampus-worker.js` — refinamento da máscara, coordenadas longitudinais por equação de Laplace (método do HippUnfold) e parcelamento cabeça/corpo/cauda com morfometria; ver seção abaixo |
 | Exportação | CSV longo, JSON completo, **SAV** (`js/sav.js`, escritor SPSS nativo), **PDF** (`js/pdf.js` + `js/report.js`, sem dependências), NIfTI da segmentação e do volume conformado, pacote ZIP |
@@ -28,12 +31,40 @@ Ao alterar arquivos, mude `VERSION` em `sw.js` para invalidar o cache dos usuár
 ## Requisitos do navegador
 
 - Chrome/Edge ≥ 114, Firefox ≥ 114, Safari ≥ 16.4 (workers com módulos ES, `CompressionStream`, WebGL2).
-- Segmentação aparc+aseg 104 em GPU dedicada: 10–60 s. Em GPU integrada ou CPU: minutos; use **Baixa memória** se aparecer erro de textura.
+- Segmentação em GPU dedicada: 10–60 s por rede (a fusão roda duas). Em GPU integrada: minutos — o app lê `MAX_TEXTURE_SIZE` e já começa no modo baixa memória quando a saída do modelo não cabe numa textura (ex.: 104 classes em GPUs com textura máxima 8192 ou 16384); se ainda faltar memória, recua sozinho para baixa memória e depois CPU.
+- Backend CPU (tfjs em JavaScript, uma thread): viável só com paciência — dezenas de minutos a horas por rede. Use GPU.
+- Sem GPU (WebGL por software, ex.: SwiftShader) a interface congela alguns segundos ao desenhar cada volume 256³; o processamento do app roda em workers e não trava a interface (< 1 s medido nos testes).
 - Safari limita a memória do WebGL; prefira `aseg 18` ou o modo baixa memória.
+
+## Precisão medida (Dice contra o FreeSurfer)
+
+Referência: `aparc+aseg.mgz` do FreeSurfer distribuído com o OpenNeuro **ds002790 (AOMIC-PIOP2)**, sujeitos 0001–0003 (T1 3 T, ~1 mm). A saída do app (inferência com o `brainchop-webworker.js` do app sobre a conformação idêntica à do app, via tfjs-node) foi comparada à do FreeSurfer reamostrada por vizinho mais próximo pelas affines. Média dos 3 sujeitos:
+
+| Modelo | Subcortical (8 estruturas × L/R) | Parcelas corticais DK (68) | Ventrículos, cerebelo, tronco, SB, CC | Cobertura do cérebro FS |
+|---|---|---|---|---|
+| **Fusão 104 + aseg 18 (padrão)** | **0,81** | **0,59** | 0,68 | 97,6 % |
+| aparc+aseg 104 | 0,69 | 0,54 | 0,64 | 84,0 % |
+| aparc+aseg 50 (L/R fundidos) | 0,74 | 0,65 | 0,80 | 90,6 % |
+| aseg 18 (L/R fundidos) | 0,81 | — | 0,81 | 97,6 % |
+
+Por estrutura na fusão (Dice / |erro de volume|): tálamo 0,89 / 10 % · caudado 0,88 / 7 % · putâmen 0,88 / 15 % · hipocampo 0,83 / 4 % · diencéfalo ventral 0,82 / 6 % · pálido 0,75 / 12 % · amígdala 0,74 / 25 % · accumbens 0,67 / 14 %. No `aparc+aseg 104` sozinho o hipocampo tinha Dice 0,69 e erro de volume de 27 % — por isso a fusão é o padrão. Parcelas corticais: melhores no cíngulo anterior, orbitofrontal e ínsula (~0,70); piores no polo frontal, pars orbitalis e cúneo (0,3–0,4).
+
+**O que isso significa.** As estruturas subcorticais grandes (tálamo, caudado, putâmen, hipocampo, diencéfalo ventral: Dice 0,82–0,89) servem para volumetria de pesquisa com inspeção visual; amígdala, pálido e accumbens erram mais. As parcelas corticais (0,59) **não** igualam FreeSurfer/FastSurfer/SynthSeg — nem o subcortical iguala o FastSurfer, que foi treinado justamente para reproduzir o FreeSurfer. Esse teto vem dos pesos das redes MeshNet (pequenas, para caber no navegador), não do código — a conformação é idêntica à do FreeSurfer/FastSurfer e a escala de intensidade alternativa (`?conform=robust`, janela do NiiVue) deu o mesmo Dice (±0,01). Para precisão de FreeSurfer/FastSurfer/SynthSeg, rode a ferramenta original e **importe** a segmentação (abaixo): o app então reproduz exatamente os volumes dela (Dice 1,000 medido) e acrescenta hipocampo, relatório, SAV e coorte.
+
+Reproduzir: `tests/e2e/import.e2e.mjs` (importação) e o protocolo acima; os números acima são de 2026-09 e mudam se os modelos mudarem.
+
+## Importar segmentação (FreeSurfer · FastSurfer · SynthSeg)
+
+1. Abra o T1 do sujeito (o mesmo que entrou na ferramenta externa).
+2. **Importar segmentação** → `aparc+aseg.mgz`, `aseg.mgz`, `aparc.DKTatlas+aseg.deep.mgz` (FastSurfer) ou o `.nii.gz` do `mri_synthseg --parc`.
+3. Os códigos são lidos pelo `FreeSurferColorLUT` (nomes/cores oficiais), os volumes são contados na **grade nativa** da segmentação (iguais aos do FreeSurfer) e os rótulos são reamostrados por vizinho mais próximo para a grade conformada do T1, para visualização e análise hipocampal. Até 255 rótulos distintos (o `aparc.a2009s` não cabe).
+
+Tudo no navegador, como o resto: o arquivo não sai da máquina.
 
 ## Limites honestos
 
-- Os modelos MeshNet foram treinados em **T1 ~1 mm isotrópico**. O modo robusto reduz o artefato de cortes espessos mas **não** é o SynthSeg/SynthSR. Para FLAIR 5 mm, TC ou baixo campo, rode `mri_synthseg --robust` / `recon-all-clinical` no FreeSurfer e importe o NIfTI de saída aqui apenas para estatísticas e relatório.
+- Os modelos MeshNet foram treinados em **T1 ~1 mm isotrópico**. O modo robusto reduz o artefato de cortes espessos mas **não** é o SynthSeg/SynthSR. Para FLAIR 5 mm, TC ou baixo campo, rode `mri_synthseg --robust` / `recon-all-clinical` no FreeSurfer e importe a saída (seção acima).
+- Parcelas corticais com Dice ~0,6 contra o FreeSurfer: servem para visão geral e volumes lobares; para estudos de espessura/volume por giro, importe FreeSurfer/FastSurfer.
 - Não há estimativa de eTIV; normalize pelo parênquima total ou por eTIV externo.
 - Estruturas pequenas (amígdala, accumbens, corno temporal) têm erro maior; inspecione cada caso.
 - Uso em pesquisa; não substitui laudo.
@@ -118,19 +149,32 @@ O que o Morfo Studio implementa é o **esqueleto geométrico comum** a essas abo
 
 ## Modelo próprio
 
-Selecione *Modelo próprio (tfjs, URL)* e informe `model.json` + `labels.json` hospedados com CORS (GitHub Pages serve). O modelo deve aceitar um tensor `[1, 256, 256, 256, 1]` uint8 conformado (convenção brainchop). Redes SynthSeg convertidas para tfjs se encaixam aqui.
+Selecione *Modelo próprio (tfjs, URL)* e informe `model.json` + `labels.json` hospedados com CORS (GitHub Pages serve). O modelo deve aceitar um tensor `[1, 256, 256, 256, 1]` uint8 conformado (convenção brainchop) e ser **sequencial** — o executor do brainchop aplica as camadas uma após a outra (MeshNet). U-Nets com conexões de salto, como SynthSeg e FastSurfer, **não** rodam aqui; para elas use a importação de segmentação.
 
 ## Estrutura
 
 ```
 index.html  styles.css  manifest.json  sw.js
-js/   app.js  quality.js  preprocess-worker.js  fsl-prep.js  mask-worker.js  n4.js  motion-worker.js  hippocampus.js  hippocampus-worker.js  stats.js  sav.js  pdf.js  report.js  zip.js  nifti-writer.js
-      brainchop-webworker.js  brainchop-parameters.js  tensor-utils.js  bwlabels.js   (brainchop, MIT)
+js/   app.js  quality.js  conform-worker.js  preprocess-worker.js  fsl-prep.js  mask-worker.js  n4.js  motion-worker.js
+      fusion.js  fusion-worker.js  seg-import-worker.js  fs-lut.js  hippocampus.js  hippocampus-worker.js
+      stats.js  sav.js  pdf.js  report.js  zip.js  nifti-writer.js
+      brainchop-webworker.js  brainchop-parameters.js  tensor-utils.js  bwlabels.js   (brainchop, MIT; com correções)
 vendor/  niivue.min.js (NiiVue 0.69 ESM)  tf.fesm.min.js (TensorFlow.js 4.22)  dcm2niix/ (WASM)
 models/  model5_gw_ae  model20chan3cls  model30chan18cls  model30chan50cls  model21_104class
 fonts/   Archivo, Source Sans 3, JetBrains Mono (OFL)
 licenses/
+tests/   unit/ (Node puro)  e2e/ (Chromium via Playwright)   — fora do cache offline
 ```
+
+## Testes
+
+```sh
+for t in tests/unit/*.test.mjs; do node "$t" || break; done   # N4, movimento, FSL, hipocampo, fusão, bwlabels
+node tests/e2e/app.e2e.mjs            # fluxo completo com ?mock (rede de máscara real; rótulos sintéticos) + exportações + coorte
+node tests/e2e/import.e2e.mjs T1.nii.gz aparc+aseg.mgz /tmp/saida   # importação real + hipocampo
+```
+
+O E2E mede também o congelamento da interface: o código do app deve ficar abaixo de 1 s por tarefa (o envio de textura do NiiVue é medido à parte, porque depende da GPU).
 
 ## Análise em R
 
@@ -145,4 +189,4 @@ d$hip_L_norm <- d$Left.Hippocampus_mm3 / d$icv_proxy
 
 ## Créditos
 
-brainchop (Masoud, Hossein, Plis — MeshNet; MIT) · NiiVue (Rorden, Hanayik; BSD) · dcm2niix (Rorden; BSD) · TensorFlow.js (Apache 2.0) · fontes via Fontsource (OFL). Ver `licenses/`.
+brainchop (Masoud, Hossein, Plis — MeshNet; MIT) · NiiVue (Rorden, Hanayik; BSD-2) · gl-matrix (MIT) · regra de conformação do FastSurfer (Apache 2.0) · FreeSurferColorLUT (FreeSurfer) · dcm2niix (Rorden; BSD) · TensorFlow.js (Apache 2.0) · fontes via Fontsource (OFL). Ver `licenses/`.

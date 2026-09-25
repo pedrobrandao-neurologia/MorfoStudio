@@ -203,39 +203,28 @@ export class BWLabeler {
   } // translate_labels()
 
   // retain only the largest cluster for each region
+  // Morfo Studio: O(n + clusters) — o original comparava todos os pares de clusters (O(clusters²):
+  // 7 s com 60 mil clusters). Mesma regra: vence o maior; empate → o de maior índice.
   largest_original_cluster_labels(bw, cl, ls) {
     const nvox = bw.length
     const ls2bw = new Uint32Array(cl + 1).fill(0)
     const sumls = new Uint32Array(cl + 1).fill(0)
     for (let i = 0; i < nvox; i++) {
-      const bwVal = bw[i]
-      const lsVal = ls[i]
-      ls2bw[lsVal] = bwVal
-      sumls[lsVal]++
+      ls2bw[ls[i]] = bw[i]
+      sumls[ls[i]]++
     }
+    const winner = new Map() // valor de bw → índice do cluster vencedor
     let mxbw = 0
     for (let i = 0; i < cl + 1; i++) {
-      const bwVal = ls2bw[i]
-      mxbw = Math.max(mxbw, bwVal)
-      // see if this is largest cluster of this bw-value
-      for (let j = 0; j < cl + 1; j++) {
-        if (j === i) {
-          continue
-        }
-        if (bwVal !== ls2bw[j]) {
-          continue
-        }
-        if (sumls[i] < sumls[j]) {
-          ls2bw[i] = 0
-        } else if (sumls[i] === sumls[j] && i < j) {
-          ls2bw[i] = 0
-        } // ties: arbitrary winner
-      }
+      const v = ls2bw[i]
+      mxbw = Math.max(mxbw, v)
+      const w = winner.get(v)
+      if (w === undefined || sumls[i] > sumls[w] || (sumls[i] === sumls[w] && i > w)) winner.set(v, i)
     }
-    const vxs = new Uint32Array(nvox).fill(0)
-    for (let i = 0; i < nvox; i++) {
-      vxs[i] = ls2bw[ls[i]]
-    }
+    const keep = new Uint32Array(cl + 1)
+    for (const [v, i] of winner) keep[i] = v
+    const vxs = new Uint32Array(nvox)
+    for (let i = 0; i < nvox; i++) vxs[i] = keep[ls[i]]
     return [mxbw, vxs]
   }
 
