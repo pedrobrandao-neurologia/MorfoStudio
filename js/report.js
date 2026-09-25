@@ -23,6 +23,7 @@ export function buildReport({ meta, quality, result, snapshot, modelInfo, hippo 
     pdf.text(595.28 - M, 818, `p. ${page}`, { size: 7.5, color: MUTED, align: 'right' })
   }
   const ensure = (y, need) => { if (y + need > 790) { footer(); return header() } return y }
+  const pg = (yy, lh) => ensure(yy, lh)
 
   // ---------- página 1
   let y = header()
@@ -57,7 +58,7 @@ export function buildReport({ meta, quality, result, snapshot, modelInfo, hippo 
   pdf.rect(mx - 0.75, y - 4, 1.5, 17, DARK)
   pdf.text(mx, y - 6, `corte ${quality.voxMax.toFixed(1)} mm`, { size: 7.5, bold: true, align: 'center' })
   y += 40
-  for (const r of quality.reasons) { y = pdf.paragraph(M + 8, y, '• ' + r, { size: 8.5, width: W - 8, color: [60, 60, 60] }) }
+  for (const r of quality.reasons) { y = pdf.paragraph(M + 8, y, '• ' + r, { size: 8.5, width: W - 8, color: [60, 60, 60] , beforeLine: pg }) }
   y += 8
   // imagem
   if (snapshot) {
@@ -89,10 +90,10 @@ export function buildReport({ meta, quality, result, snapshot, modelInfo, hippo 
   })
   y += Math.ceil(cards.length / 3) * (chh + 5) + 6
   const Hm = result.hemispheres
-  y = pdf.paragraph(M, y, `Hemisférios (${Hm.method}): esquerdo ${fmt(Hm.left_parenchyma_mm3)} mm³ · direito ${fmt(Hm.right_parenchyma_mm3)} mm³.`, { size: 8.5, width: W, color: [60, 60, 60] })
+  y = pdf.paragraph(M, y, `Hemisférios (${Hm.method}): esquerdo ${fmt(Hm.left_parenchyma_mm3)} mm³ · direito ${fmt(Hm.right_parenchyma_mm3)} mm³.`, { size: 8.5, width: W, color: [60, 60, 60] , beforeLine: pg })
   if (Object.keys(result.lobes).length) {
     const lob = Object.values(result.lobes).map((l) => `${l.name_pt} ${fmt(l.total_mm3)}${l.left_mm3 != null ? ` (E ${fmt(l.left_mm3)} / D ${fmt(l.right_mm3)})` : ''}`).join(' · ')
-    y = pdf.paragraph(M, y, `Lobos (mm³): ${lob}.`, { size: 8.5, width: W, color: [60, 60, 60] })
+    y = pdf.paragraph(M, y, `Lobos (mm³): ${lob}.`, { size: 8.5, width: W, color: [60, 60, 60] , beforeLine: pg })
   }
 
   // ---------- tabela de regiões
@@ -165,11 +166,11 @@ export function buildReport({ meta, quality, result, snapshot, modelInfo, hippo 
     }
     if (hippo.asymmetry?.total_pct != null) {
       const a = hippo.asymmetry
-      y = pdf.paragraph(M, y + 2, `Assimetria 2(E−D)/(E+D)×100: total ${fmt(a.total_pct, 1)} % · cabeça ${fmt(a.head_pct, 1)} · corpo ${fmt(a.body_pct, 1)} · cauda ${fmt(a.tail_pct, 1)}.`, { size: 8.5, width: W, color: [60, 60, 60] })
+      y = pdf.paragraph(M, y + 2, `Assimetria 2(E−D)/(E+D)×100: total ${fmt(a.total_pct, 1)} % · cabeça ${fmt(a.head_pct, 1)} · corpo ${fmt(a.body_pct, 1)} · cauda ${fmt(a.tail_pct, 1)}.`, { size: 8.5, width: W, color: [60, 60, 60] , beforeLine: pg })
     }
     const flags = [...(hippo.left?.qc_flags || []).map((x) => 'E: ' + x), ...(hippo.right?.qc_flags || []).map((x) => 'D: ' + x)]
-    for (const fl of flags) { y = ensure(y, 12); y = pdf.paragraph(M, y, '(!) ' + fl, { size: 8, width: W, color: TIER_COLOR.C }) }
-    y = pdf.paragraph(M, y + 2, `Método: máscara do rótulo "Hippocampus" ${hippo.options?.refine ? 'refinada por modelo de intensidade robusto (mediana ± k·MAD), fechamento morfológico e maior componente conexo, ' : ''}dividida em cabeça/corpo/cauda por um campo de coordenadas longitudinal — equação de Laplace resolvida no interior da máscara (abordagem do HippUnfold), reparametrizada por comprimento de arco (cortes em ${Math.round((hippo.options?.headFrac ?? 1 / 3) * 100)} % e ${Math.round((hippo.options?.tailFrac ?? 2 / 3) * 100)} %, divisão proporcional da convenção de marcos de Poppenk et al. 2013). São subregiões geométricas, não subcampos histológicos (CA1–CA4, GD, subículo exigem T2 dedicado ou modelos treinados — HippUnfold, HSF, ASHS, FreeSurfer segmentHA).`, { size: 8, width: W, color: MUTED })
+    for (const fl of flags) { y = ensure(y, 12); y = pdf.paragraph(M, y, '(!) ' + fl, { size: 8, width: W, color: TIER_COLOR.C , beforeLine: pg }) }
+    y = pdf.paragraph(M, y + 2, `Método: máscara do rótulo "Hippocampus" ${hippo.options?.refine ? 'refinada por modelo de intensidade robusto (mediana ± k·MAD), fechamento morfológico e maior componente conexo, ' : ''}dividida em cabeça/corpo/cauda por um campo de coordenadas longitudinal — equação de Laplace resolvida no interior da máscara (abordagem do HippUnfold), reparametrizada por comprimento de arco (cortes em ${Math.round((hippo.options?.headFrac ?? 1 / 3) * 100)} % e ${Math.round((hippo.options?.tailFrac ?? 2 / 3) * 100)} %, divisão proporcional da convenção de marcos de Poppenk et al. 2013). São subregiões geométricas, não subcampos histológicos (CA1–CA4, GD, subículo exigem T2 dedicado ou modelos treinados — HippUnfold, HSF, ASHS, FreeSurfer segmentHA).`, { size: 8, width: W, color: MUTED , beforeLine: pg })
   }
 
   // ---------- métodos e ressalvas
@@ -185,7 +186,7 @@ export function buildReport({ meta, quality, result, snapshot, modelInfo, hippo 
     'Referências: Masoud et al., brainchop: in-browser MRI volumetric segmentation (JOSS 2023); Fedorov et al., MeshNet (2017); Hanayik & Rorden, NiiVue; Li et al., dcm2niix (2016); Billot et al., SynthSeg (Med Image Anal 2023); Iglesias et al., SynthSR (Sci Adv 2023); Gopinath et al., recon-all-clinical (2024); Tustison et al., N4ITK (IEEE TMI 2010); Avants et al., ANTs (Insight J 2009).'
       + (hippo ? ' Hipocampo: DeKraker et al., HippUnfold (eLife 2022); Poppenk et al. (TiCS 2013); Wisse et al., nota de cautela sobre subcampos em T1 1 mm (HBM 2021); Sghirripa et al., comparação de métodos (HBM 2025); Iglesias et al., segmentHA (NeuroImage 2015); Yushkevich et al., ASHS (HBM 2015); Poiret et al., HSF (Front Neuroinform 2023).' : '')
   ]
-  for (const p of paras) { if (p) y = pdf.paragraph(M, y, p, { size: 8.5, width: W, color: [60, 60, 60] }) + 4 }
+  for (const p of paras) { if (p) y = pdf.paragraph(M, y, p, { size: 8.5, width: W, color: [60, 60, 60] , beforeLine: pg }) + 4 }
   footer()
   return pdf.build()
 }

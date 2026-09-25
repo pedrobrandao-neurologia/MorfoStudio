@@ -41,8 +41,11 @@ export function writeNifti(o) {
   v.setFloat32(116, o.sclInter ?? 0, le) // scl_inter
   v.setInt8(123, 2) // xyzt_units: mm
   // descrip (80 bytes @148)
-  const desc = (o.description || 'Morfo Studio').slice(0, 79)
-  for (let i = 0; i < desc.length; i++) v.setUint8(148 + i, desc.charCodeAt(i) & 0x7f)
+  // descrição em UTF-8 (80 bytes, terminada em zero), cortada em fronteira de caractere
+  const descBytes = new TextEncoder().encode(o.description || 'Morfo Studio')
+  let dn = Math.min(79, descBytes.length)
+  if (dn < descBytes.length) while (dn > 0 && (descBytes[dn] & 0xC0) === 0x80) dn--
+  for (let i = 0; i < dn; i++) v.setUint8(148 + i, descBytes[i])
   v.setInt16(252, 0, le) // qform_code
   v.setInt16(254, 1, le) // sform_code = SCANNER_ANAT
   const a = o.affine

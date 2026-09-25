@@ -103,7 +103,8 @@ function smooth3(img, dims, radiusVox, iters = 3) {
   let a = Float32Array.from(img), b = new Float32Array(img.length)
   for (let it = 0; it < iters; it++) {
     for (let axis = 0; axis < 3; axis++) {
-      const r = Math.max(1, Math.round(radiusVox[axis]))
+      // raio limitado ao tamanho do eixo: pixdim 0/∞ geraria raio infinito e laço sem fim
+      const r = Math.max(1, Math.min(dims[axis], Math.round(Number.isFinite(radiusVox[axis]) ? radiusVox[axis] : dims[axis])))
       boxAxis(a, b, dims, axis, r)
       const t = a; a = b; b = t
     }
@@ -141,7 +142,7 @@ function biasCorrect(img, dims, pixdims, sigmaMM) {
 self.onmessage = (e) => {
   const { img, dims, pixdims, affine, options } = e.data
   try {
-    let cur = new Float32Array(img), curDims = [...dims], curPix = [...pixdims]
+    let cur = img, curDims = [...dims], curPix = [...pixdims] // img já é um Float32Array transferido (sem cópia)
     let curAffine = [...affine]
     const log = []
     const prov = {}
@@ -162,18 +163,19 @@ self.onmessage = (e) => {
       log.push(c.log)
     }
     // 1. reamostragem dos eixos espessos
-    const target = Math.max(options.targetMM || 1.0, Math.min(...pixdims))
+    const target = Math.max(options.targetMM || 1.0, Math.min(...curPix))
     for (let axis = 0; axis < 3; axis++) {
       if (curPix[axis] > target * 1.15 && curDims[axis] > 1) {
         const nNew = Math.round((curDims[axis] - 1) * curPix[axis] / target) + 1
         progress(`Reamostragem cúbica do eixo ${'xyz'[axis]}: ${curDims[axis]} → ${nNew} cortes`, 0.1 + axis * 0.15)
+        const pixBefore = curPix[axis] // após a reorientação os eixos podem ter sido permutados
         const r = resampleAxis(cur, curDims, axis, nNew)
         const f = (curDims[axis] - 1) / Math.max(1, nNew - 1) // novo passo em unidades de voxel antigo
         cur = r.img; curDims = r.dims
         // affine: coluna do eixo escalada por f (mesma origem, centro do primeiro voxel)
         curAffine[axis] *= f; curAffine[4 + axis] *= f; curAffine[8 + axis] *= f
         curPix[axis] = curPix[axis] * f
-        log.push(`eixo ${'xyz'[axis]}: ${pixdims[axis].toFixed(2)} → ${curPix[axis].toFixed(2)} mm (Catmull-Rom)`)
+        log.push(`eixo ${'xyz'[axis]}: ${pixBefore.toFixed(2)} → ${curPix[axis].toFixed(2)} mm (Catmull-Rom)`)
       }
     }
     // 2/3. campo de viés: N4 (ANTs-like) ou homomórfico — roda sobre a imagem já reorientada/recortada,

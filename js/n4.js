@@ -230,7 +230,7 @@ export function otsuThreshold(img) {
  *   shrink (4), maxIterations por nível ([50,50,50,50]), convergence (1e-7),
  *   nBins (200), fwhm (0.15), wienerNoise (0.01), splineDistance (mm, 200 — 1 célula inicial)
  * @param {function} [onProgress] (mensagem, fração)
- * @returns {{img: Float32Array, logField: Float32Array, applied: boolean, log: string[]}}
+ * @returns {{img: Float32Array, logField: Float32Array|null (só com opt.returnField), applied: boolean, log: string[]}}
  */
 export function n4BiasCorrect(img, dims, pixdims, opt = {}, onProgress) {
   const o = {
@@ -279,7 +279,7 @@ export function n4BiasCorrect(img, dims, pixdims, opt = {}, onProgress) {
   //  2. coeficiente de variação interno do bloco ≤ maskPurityCV (exclui blocos que misturam
   //     classes de tecido, ex. casca GM/SB). A máscara alimenta só o AJUSTE; o campo suave
   //     é avaliado em todo o volume, então excluir blocos mistos não perde cobertura.
-  const purityCV = o.maskPurityCV ?? 0.12
+  const purityCV = opt.maskPurityCV ?? 0.12
   const maskIdx = []
   for (let i = 0; i < sub.length; i++) {
     if (!(sub[i] > thr && sub[i] > 0 && subAbove[i] >= 0.9 * subN[i])) continue
@@ -341,14 +341,14 @@ export function n4BiasCorrect(img, dims, pixdims, opt = {}, onProgress) {
   }
   // ---- reconstrução na resolução original (trilinear do campo de baixa frequência) e aplicação
   const out = new Float32Array(img.length)
-  const logField = new Float32Array(img.length)
+  const logField = opt.returnField ? new Float32Array(img.length) : null
   const fx = (sx - 1) / Math.max(1, nx - 1), fy = (sy - 1) / Math.max(1, ny - 1), fz = (sz - 1) / Math.max(1, nz - 1)
   for (let z = 0; z < nz; z++) {
-    const gz = z * fz, z0 = Math.min(sz - 2, Math.floor(gz)), tz = sz > 1 ? gz - z0 : 0
+    const gz = z * fz, z0 = Math.max(0, Math.min(sz - 2, Math.floor(gz))), tz = sz > 1 ? gz - z0 : 0
     for (let y = 0; y < ny; y++) {
-      const gy = y * fy, y0 = Math.min(sy - 2, Math.floor(gy)), ty = sy > 1 ? gy - y0 : 0
+      const gy = y * fy, y0 = Math.max(0, Math.min(sy - 2, Math.floor(gy))), ty = sy > 1 ? gy - y0 : 0
       for (let x = 0; x < nx; x++) {
-        const gx = x * fx, x0 = Math.min(sx - 2, Math.floor(gx)), tx = sx > 1 ? gx - x0 : 0
+        const gx = x * fx, x0 = Math.max(0, Math.min(sx - 2, Math.floor(gx))), tx = sx > 1 ? gx - x0 : 0
         const c000 = fieldSub[x0 + y0 * sx + z0 * sx * sy], c100 = fieldSub[Math.min(sx - 1, x0 + 1) + y0 * sx + z0 * sx * sy]
         const c010 = fieldSub[x0 + Math.min(sy - 1, y0 + 1) * sx + z0 * sx * sy], c110 = fieldSub[Math.min(sx - 1, x0 + 1) + Math.min(sy - 1, y0 + 1) * sx + z0 * sx * sy]
         const zi = Math.min(sz - 1, z0 + 1)
@@ -360,7 +360,7 @@ export function n4BiasCorrect(img, dims, pixdims, opt = {}, onProgress) {
           (c001 * (1 - tx) + c101 * tx) * (1 - ty) * tz +
           (c011 * (1 - tx) + c111 * tx) * ty * tz
         const i = x + y * nx + z * nx * ny
-        logField[i] = f
+        if (logField) logField[i] = f
         const v = img[i]
         out[i] = v > 0 ? v / Math.exp(f) : v
       }

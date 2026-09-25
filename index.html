@@ -19,7 +19,9 @@
       <button class="btn" id="btnDicom" title="Selecionar uma pasta com arquivos DICOM">Abrir pasta DICOM</button>
       <button class="btn" id="btnNifti" title="Abrir .nii ou .nii.gz">Abrir NIfTI</button>
       <button class="btn ghost sm" id="btnDemo" title="Volume sintético para testar o fluxo (não é um cérebro real)">Exemplo</button>
+      <button class="btn sm" id="btnImportSeg" title="Importar aseg/aparc+aseg do FreeSurfer ou FastSurfer, ou a saída do SynthSeg, para estatísticas e relatório (abra o T1 do mesmo exame antes)">Importar segmentação</button>
     </div>
+    <input type="file" id="inSeg" accept=".nii,.nii.gz,.gz,.mgz,.mgh">
     <input type="file" id="inDicom" webkitdirectory directory multiple>
     <input type="file" id="inNifti" accept=".nii,.nii.gz,.gz,.mgz,.mgh,.nrrd" multiple>
     <div class="spacer"></div>
@@ -50,6 +52,7 @@
       <div class="field">
         <label for="modelSel">Atlas de saída</label>
         <select id="modelSel">
+          <option value="fusion" selected>Fusão 104 + aseg 18 — mais preciso (2 redes)</option>
           <option value="aparc_aseg_104">aparc+aseg 104 — cortical L/R, cerebelo, tronco, CC</option>
           <option value="aparc_aseg_50">aparc+aseg 50 — homólogos L/R fundidos</option>
           <option value="aseg_18">aseg 18 — subcortical + tecidos</option>
@@ -61,7 +64,7 @@
       <div class="field" id="customModelField" hidden>
         <label for="customModelUrl">URL do model.json</label><input type="url" id="customModelUrl" placeholder="https://…/model.json">
         <label for="customLabelsUrl" style="margin-top:6px">URL do labels.json</label><input type="url" id="customLabelsUrl" placeholder="https://…/labels.json">
-        <p class="hint">Entrada 256³ uint8 conformado (padrão brainchop). Para redes tipo SynthSeg, converta para tfjs e aponte aqui.</p>
+        <p class="hint">Entrada 256³ uint8 conformado (padrão brainchop). Só redes sequenciais (camada após camada, como a MeshNet): U-Nets com conexões de salto (SynthSeg, FastSurfer) não rodam neste executor — para elas, rode a ferramenta original e use <b>Importar segmentação</b>.</p>
       </div>
       <label class="chk"><input type="checkbox" id="lowMem"> Baixa memória (convolução sequencial, mais lento)</label>
       <div class="field" style="margin-top:8px"><label for="backendSel">Backend de inferência</label>
